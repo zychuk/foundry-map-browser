@@ -4,6 +4,11 @@ const FOLDER_NAME = "Zychu Maps";
 let catalogCache = null;
 let browserInstance = null;
 
+const naturalCollator = new Intl.Collator(undefined, {
+    numeric: true,
+    sensitivity: "base"
+});
+
 /* -------------------------------------------- */
 /*  Inicjalizacja i ustawienia                  */
 /* -------------------------------------------- */
@@ -47,6 +52,11 @@ Hooks.on("renderCompendiumDirectory", (app, html) => {
     }
 });
 
+// Automatyczne odświeżanie okna przeglądarki po usunięciu kompendium w Foundry
+Hooks.on("deleteCompendium", () => {
+    if (browserInstance?.rendered) browserInstance.refreshGridOnly();
+});
+
 /* -------------------------------------------- */
 /*  Funkcje pomocnicze i budowanie URL          */
 /* -------------------------------------------- */
@@ -57,11 +67,27 @@ function getServerUrl() {
 }
 
 /**
- * Koduje ścieżkę w dwóch wariantach:
- * - decodeFirst = true: dla ścieżek, które są już częściowo zakodowane URL-em (np. %20 -> spacja na dysku)
- * - decodeFirst = false: dla ścieżek, które mają dosłowne znaki %20 w nazwie pliku na dysku Linuksa
+ * Zwraca czystą nazwę paczki (bez prefiksów autora i ze spójnym formatowaniem do sortowania)
  */
-function buildRemoteUrl(baseUrl, relativePath, decodeFirst = true) {
+function getCleanPackTitle(pack) {
+    return (pack.title || pack.moduleId || "")
+    .replace(/^(Cze and Peku\s*-\s*|Czepeku Scenes\s*-\s*|Czepeku\s*-\s*)/i, "")
+    .trim();
+}
+
+/**
+ * Klucz do sortowania alfabetycznego (ignoruje wiodące numery katalogowe typu "01 - ", aby sortować wyłącznie po nazwie)
+ */
+function getSortKey(pack) {
+    return getCleanPackTitle(pack)
+    .replace(/^\d+\s*[-–.]*\s*/, "")
+    .trim();
+}
+
+/**
+ * Bezpiecznie koduje ścieżkę do pełnego URL na serwerze map (bez podwójnego kodowania %20)
+ */
+function buildRemoteUrl(baseUrl, relativePath) {
     if (!relativePath || typeof relativePath !== "string") return "";
     const trimmed = relativePath.trim();
     if (!trimmed) return "";
@@ -76,7 +102,6 @@ function buildRemoteUrl(baseUrl, relativePath, decodeFirst = true) {
     const encoded = clean
     .split("/")
     .map(segment => {
-        if (!decodeFirst) return encodeURIComponent(segment);
         try {
             return encodeURIComponent(decodeURIComponent(segment));
         } catch {
@@ -87,76 +112,32 @@ function buildRemoteUrl(baseUrl, relativePath, decodeFirst = true) {
     return `${baseUrl}/${encoded}`;
 }
 
-function normalizeRelativeModulePath(assetPath, moduleId) {
-    if (!assetPath || typeof assetPath !== "string") return "";
-    const clean = assetPath.trim().replace(/^\/+/, "");
-    if (!clean) return "";
-    if (clean.startsWith("http://") || clean.startsWith("https://") || clean.startsWith("data:")) {
-        return clean;
-    }
-    if (clean.startsWith("icons/") || clean.startsWith("ui/")) {
-        return clean;
-    }
-    if (clean.startsWith("modules/") || clean.startsWith("thumbs/")) {
-        return clean;
-    }
-    return `modules/${moduleId}/${clean}`;
-}
-
-function resolveAssetUrl(baseUrl, assetPath, moduleId, decodeFirst = true) {
-    const norm = normalizeRelativeModulePath(assetPath, moduleId);
-    if (!norm) return "";
-    return buildRemoteUrl(baseUrl, norm, decodeFirst);
-}
-
 /**
- * Sprawdza, który wariant kodowania URL (z dekodowaniem %20 lub z dosłownym %20 na dysku)
- * faktycznie istnieje na serwerze dla danej paczki.
+ * Rozwiązuje ścieżkę zasobu i wymusza poprawną nazwę folderu modułu na dysku (modules/<pack.moduleId>/...)
  */
-async function detectWorkingUrlEncoding(baseUrl, pack, rawScenes) {
-    const firstRaw = rawScenes?.[0];
-    const firstMeta = pack.scenes?.[0];
-    const samplePath = firstMeta?.bg || firstRaw?.background?.src || firstRaw?.img;
-    if (!samplePath) return { decodeFirst: true, forceModulePrefix: false };
-
-    const candidates = [
-        { decodeFirst: true, forceModulePrefix: false },
-        { decodeFirst: false, forceModulePrefix: false },
-        { decodeFirst: true, forceModulePrefix: true },
-        { decodeFirst: false, forceModulePrefix: true }
-    ];
-
-    for (const cand of candidates) {
-        let testRel = normalizeRelativeModulePath(samplePath, pack.moduleId);
-        if (cand.forceModulePrefix && testRel.startsWith("modules/")) {
-            const parts = testRel.split("/");
-            parts[1] = pack.moduleId;
-            testRel = parts.join("/");
-        }
-        const testUrl = buildRemoteUrl(baseUrl, testRel, cand.decodeFirst);
-        try {
-            const resp = await fetch(testUrl, { method: "HEAD" });
-            if (resp.ok) return cand;
-        } catch {
-            // Próbuj kolejny wariant
-        }
-    }
-
-    // Jeśli wszystkie zwróciły błąd (np. 404), wypisz czytelne ostrzeżenie w konsoli
-    const defaultUrl = resolveAssetUrl(baseUrl, samplePath, pack.moduleId, true);
-    console.warn(`[${MODULE_ID}] Nie udało się zweryfikować pliku obrazu tła (sprawdź czy plik istnieje na serwerze): ${defaultUrl}`);
-    return { decodeFirst: true, forceModulePrefix: false };
-}
-
-function buildFinalAssetUrl(baseUrl, assetPath, moduleId, encodingStrategy) {
+function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     if (!assetPath || typeof assetPath !== "string") return "";
-    let rel = normalizeRelativeModulePath(assetPath, moduleId);
-    if (encodingStrategy?.forceModulePrefix && rel.startsWith("modules/")) {
-        const parts = rel.split("/");
-        parts[1] = moduleId;
-        rel = parts.join("/");
+    const trimmed = assetPath.trim();
+    if (!trimmed) return "";
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("data:")) {
+        return trimmed;
     }
-    return buildRemoteUrl(baseUrl, rel, encodingStrategy ? encodingStrategy.decodeFirst : true);
+    if (trimmed.startsWith("icons/") || trimmed.startsWith("ui/")) {
+        return trimmed;
+    }
+
+    const clean = trimmed.replace(/^\/+/, "");
+    if (clean.startsWith("thumbs/")) {
+        return buildRemoteUrl(baseUrl, clean);
+    }
+    if (clean.startsWith("modules/")) {
+        const parts = clean.split("/");
+        if (moduleId && parts.length > 2) {
+            parts[1] = moduleId;
+        }
+        return buildRemoteUrl(baseUrl, parts.join("/"));
+    }
+    return buildRemoteUrl(baseUrl, `modules/${moduleId}/${clean}`);
 }
 
 async function loadCatalog(force = false) {
@@ -182,6 +163,9 @@ function getCompendiumSlug(moduleId) {
     return `zmb-${slug}`;
 }
 
+/**
+ * Znajduje istniejące kompendium w świecie dla danej paczki map
+ */
 function findPackCompendium(pack) {
     const expectedName = getCompendiumSlug(pack.moduleId);
     return game.packs.find(p => {
@@ -192,6 +176,21 @@ function findPackCompendium(pack) {
     });
 }
 
+/**
+ * Sprawdza, czy konkretny wariant sceny znajduje się wewnątrz kompendium danej paczki
+ */
+function isVariantInCompendium(compendium, sceneMeta) {
+    if (!compendium || !compendium.index) return false;
+    for (const entry of compendium.index) {
+        if (entry.flags?.[MODULE_ID]?.sceneId === sceneMeta.id) return true;
+        if (entry.name === sceneMeta.name) return true;
+    }
+    return false;
+}
+
+/**
+ * Sprawdza status zaimportowania paczki wyłącznie na podstawie jej Kompendium
+ */
 function getPackStatus(pack) {
     const compendium = findPackCompendium(pack);
     const totalCount = pack.sceneCount || pack.scenes.length;
@@ -206,21 +205,37 @@ function getPackStatus(pack) {
         };
     }
 
-    const indexedCount = compendium.index ? compendium.index.size : totalCount;
-    const importedCount = indexedCount > 0 ? indexedCount : totalCount;
+    const importedCount = compendium.index ? compendium.index.size : 0;
 
     return {
         compendium,
         importedCount,
         totalCount,
-        isImported: true,
+        isImported: importedCount > 0,
         isFullyImported: importedCount >= totalCount
     };
 }
 
 /**
+ * Ładuje indeksy wszystkich kompendiów stworzonych przez moduł, aby liczby scen były dokładne
+ */
+async function preloadModuleCompendiumIndexes() {
+    const promises = [];
+    for (const pack of game.packs) {
+        if (pack.documentName === "Scene" && (
+            pack.metadata.name?.startsWith("zmb-") ||
+            pack.metadata.flags?.[MODULE_ID]
+        )) {
+            promises.push(pack.getIndex({ fields: ["name", "flags"] }).catch(() => {}));
+        }
+    }
+    if (promises.length > 0) {
+        await Promise.all(promises);
+    }
+}
+
+/**
  * Znajduje lub tworzy folder "Zychu Maps" w zakładce Compendium Packs
- * (i przemianowuje stary folder "Homelab Maps", jeśli istnieje)
  */
 async function getOrCreateCompendiumFolder() {
     let folder = game.folders.find(f => f.type === "Compendium" && f.name === FOLDER_NAME);
@@ -246,7 +261,7 @@ async function getOrCreateCompendiumFolder() {
 }
 
 /**
- * Przypisuje kompendium do folderu Zychu Maps w Foundry v12-v14
+ * Przypisuje kompendium do folderu "Zychu Maps"
  */
 async function assignCompendiumToFolder(compendium, folder) {
     if (!compendium || !folder) return;
@@ -259,6 +274,43 @@ async function assignCompendiumToFolder(compendium, folder) {
     } catch (err) {
         console.warn(`[${MODULE_ID}] Błąd przypisywania kompendium do folderu:`, err);
     }
+}
+
+/**
+ * Pobiera lub tworzy puste kompendium dla danej paczki w folderze "Zychu Maps"
+ */
+async function getOrCreatePackCompendium(pack) {
+    const cleanTitle = getCleanPackTitle(pack);
+    const compFolder = await getOrCreateCompendiumFolder();
+    let compendium = findPackCompendium(pack);
+
+    if (!compendium) {
+        const compName = getCompendiumSlug(pack.moduleId);
+        compendium = await CompendiumCollection.createCompendium({
+            name: compName,
+            label: cleanTitle,
+            type: "Scene",
+            package: "world",
+            folder: compFolder?.id || null,
+            flags: {
+                [MODULE_ID]: {
+                    moduleId: pack.moduleId,
+                    version: pack.version || "1.0.0"
+                }
+            }
+        });
+    }
+
+    if (compFolder && compendium.folder?.id !== compFolder.id) {
+        await assignCompendiumToFolder(compendium, compFolder);
+    }
+
+    if (compendium.locked) {
+        await compendium.configure({ locked: false });
+    }
+
+    await compendium.getIndex({ fields: ["name", "flags"] });
+    return compendium;
 }
 
 /* -------------------------------------------- */
@@ -295,9 +347,9 @@ function normalizeLegacyWalls(walls) {
     }).filter(Boolean);
 }
 
-function rewriteAllPaths(obj, baseUrl, moduleId, encodingStrategy) {
+function rewriteAllPaths(obj, baseUrl, moduleId) {
     if (Array.isArray(obj)) {
-        return obj.map(item => rewriteAllPaths(item, baseUrl, moduleId, encodingStrategy));
+        return obj.map(item => rewriteAllPaths(item, baseUrl, moduleId));
     }
     if (obj && typeof obj === "object") {
         const result = {};
@@ -306,9 +358,9 @@ function rewriteAllPaths(obj, baseUrl, moduleId, encodingStrategy) {
                 value.startsWith("modules/") ||
                 /\.(webp|png|jpg|jpeg|ogg|mp3|wav|webm|mp4)$/i.test(value)
             )) {
-                result[key] = buildFinalAssetUrl(baseUrl, value, moduleId, encodingStrategy);
+                result[key] = resolveAssetUrl(baseUrl, value, moduleId);
             } else {
-                result[key] = rewriteAllPaths(value, baseUrl, moduleId, encodingStrategy);
+                result[key] = rewriteAllPaths(value, baseUrl, moduleId);
             }
         }
         return result;
@@ -317,38 +369,35 @@ function rewriteAllPaths(obj, baseUrl, moduleId, encodingStrategy) {
 }
 
 /**
- * Przygotowuje obiekt sceny z gwarancją poprawnego załadowania obrazu tła (background.src)
+ * Przygotowuje obiekt sceny z gwarancją poprawnej ścieżki obrazu tła (background.src)
  */
-function prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy) {
+function prepareSceneData(raw, pack, meta, baseUrl) {
     const originalId = raw._id;
 
-    // 1. Priorytet ma meta.bg z catalog.json (ścieżka zweryfikowana na dysku przy generowaniu miniaturek)
+    // 1. Bezwzględny priorytet ma meta.bg z catalog.json (zweryfikowana ścieżka na dysku serwera!)
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
     raw.img ||
     null;
 
-    const finalBgUrl = rawBgPath
-    ? buildFinalAssetUrl(baseUrl, rawBgPath, pack.moduleId, encodingStrategy)
-    : null;
+    const finalBgUrl = rawBgPath ? resolveAssetUrl(baseUrl, rawBgPath, pack.moduleId) : null;
 
-    // 2. Miniaturka sceny (z katalogu thumbs/)
+    // 2. Miniaturka sceny
     const rawThumbPath = meta?.thumb || raw.thumb || rawBgPath;
-    const finalThumbUrl = rawThumbPath
-    ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId, true)
-    : null;
+    const finalThumbUrl = rawThumbPath ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId) : null;
 
     // 3. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu
-    let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId, encodingStrategy);
+    let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId);
     delete prepared._id;
+    delete prepared.img;
 
+    // W Foundry v9 pole "background" bywało stringiem z kolorem HEX (np. "#000000")
+    if (typeof prepared.background !== "object" || !prepared.background) {
+        prepared.background = {};
+    }
     if (finalBgUrl) {
-        prepared.img = finalBgUrl;
-        prepared.background = foundry.utils.mergeObject(
-            typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-            { src: finalBgUrl }
-        );
+        prepared.background.src = finalBgUrl;
     }
 
     // 4. Przepuść przez natywny migrator Foundry
@@ -360,20 +409,17 @@ function prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy) {
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // 5. Po migracji zachowaj zarówno background.src jak i img (aby powtórna migracja w Scene.create nie wyczyściła tła)
-    if (finalBgUrl) {
-        prepared.img = finalBgUrl;
-        if (typeof prepared.background !== "object" || !prepared.background) {
-            prepared.background = {};
-        }
-        prepared.background.src = finalBgUrl;
-    }
+    // 5. Po migracji twardo wymuś obiekt background z poprawnym src
+    delete prepared.img;
+    prepared.background = foundry.utils.mergeObject(
+        typeof prepared.background === "object" && prepared.background ? prepared.background : {},
+        { src: finalBgUrl }
+    );
 
     if (finalThumbUrl) {
         prepared.thumb = finalThumbUrl;
     }
 
-    // Upewnij się, że wymiary sceny są ustawione
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
@@ -389,7 +435,7 @@ function prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy) {
             const tileSrc = tile.texture?.src || tile.img;
             if (tileSrc) {
                 tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
-                    src: buildFinalAssetUrl(baseUrl, tileSrc, pack.moduleId, encodingStrategy)
+                    src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
                 });
             }
             delete tile.img;
@@ -432,6 +478,9 @@ function prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy) {
 /*  Akcje Importu i Usuwania Kompendiów         */
 /* -------------------------------------------- */
 
+/**
+ * Tworzy Kompendium w folderze "Zychu Maps" i importuje do niego wszystkie brakujące sceny z paczki
+ */
 async function importPackAsCompendium(pack) {
     const baseUrl = getServerUrl();
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
@@ -440,48 +489,18 @@ async function importPackAsCompendium(pack) {
     if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
 
     const rawScenes = await res.json();
-    const encodingStrategy = await detectWorkingUrlEncoding(baseUrl, pack, rawScenes);
-
-    const cleanTitle = pack.title
-    .replace(/^(Cze and Peku - |Czepeku Scenes - |Czepeku - )/i, "")
-    .trim();
-
-    const compFolder = await getOrCreateCompendiumFolder();
-    let compendium = findPackCompendium(pack);
-
-    if (!compendium) {
-        const compName = getCompendiumSlug(pack.moduleId);
-        compendium = await CompendiumCollection.createCompendium({
-            name: compName,
-            label: cleanTitle,
-            type: "Scene",
-            package: "world",
-            flags: {
-                [MODULE_ID]: {
-                    moduleId: pack.moduleId,
-                    version: pack.version || "1.0.0"
-                }
-            }
-        });
-    }
-
-    // Przypisz kompendium do folderu "Zychu Maps"
-    if (compFolder) {
-        await assignCompendiumToFolder(compendium, compFolder);
-    }
-
-    if (compendium.locked) {
-        await compendium.configure({ locked: false });
-    }
-
-    await compendium.getIndex({ fields: ["name", "flags"] });
-    const existingNames = new Set(compendium.index.map(i => i.name));
+    const compendium = await getOrCreatePackCompendium(pack);
 
     const toCreate = [];
     for (const raw of rawScenes) {
-        if (existingNames.has(raw.name)) continue;
-        const meta = pack.scenes.find(s => s.id === raw._id);
-        toCreate.push(prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy));
+        const meta =
+        pack.scenes.find(s => s.id === raw._id) ||
+        pack.scenes.find(s => s.name === raw.name);
+
+        if (meta && isVariantInCompendium(compendium, meta)) continue;
+        if (!meta && compendium.index.some(e => e.name === raw.name)) continue;
+
+        toCreate.push(prepareSceneData(raw, pack, meta, baseUrl));
     }
 
     if (toCreate.length > 0) {
@@ -490,48 +509,47 @@ async function importPackAsCompendium(pack) {
     }
 
     ui.compendium?.render(true);
-    ui.notifications.info(`Utworzono kompendium "${cleanTitle}" w folderze ${FOLDER_NAME} (${toCreate.length} scen).`);
+    ui.notifications.info(`Zapisano kompendium "${getCleanPackTitle(pack)}" (${compendium.index.size} scen).`);
     return compendium;
 }
 
-async function importSingleSceneToWorld(pack, sceneMeta) {
+/**
+ * Importuje pojedynczy wariant do Kompendium danej paczki (zamiast bezpośrednio do świata)
+ */
+async function importSingleVariantToCompendium(pack, sceneMeta) {
     const baseUrl = getServerUrl();
+    const compendium = await getOrCreatePackCompendium(pack);
+
+    // Jeśli wariant już jest w kompendium, zwróć go
+    const existingEntry = compendium.index.find(
+        e => e.flags?.[MODULE_ID]?.sceneId === sceneMeta.id || e.name === sceneMeta.name
+    );
+    if (existingEntry) {
+        return await compendium.getDocument(existingEntry._id);
+    }
 
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
     const res = await fetch(scenesUrl);
     if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
 
     const rawScenes = await res.json();
-    const raw = rawScenes.find(s => s._id === sceneMeta.id);
+    const raw =
+    rawScenes.find(s => s._id === sceneMeta.id) ||
+    rawScenes.find(s => s.name === sceneMeta.name);
     if (!raw) throw new Error("Nie znaleziono wybranej sceny w pliku scenes.json.");
 
-    const encodingStrategy = await detectWorkingUrlEncoding(baseUrl, pack, [raw]);
-    const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl, encodingStrategy);
+    const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl);
+    const createdDocs = await Scene.createDocuments([prepared], { pack: compendium.collection });
+    await compendium.getIndex({ fields: ["name", "flags"] });
 
-    // Jeśli scena jest już w świecie (np. ze starszego importu bez tła), napraw jej background.src
-    const existing = game.scenes.find(s =>
-    s.getFlag(MODULE_ID, "moduleId") === pack.moduleId &&
-    s.getFlag(MODULE_ID, "sceneId") === sceneMeta.id
-    );
-    if (existing) {
-        if (prepared.background?.src && existing.background?.src !== prepared.background.src) {
-            await existing.update({
-                "background.src": prepared.background.src,
-                thumb: prepared.thumb || existing.thumb
-            });
-        }
-        return existing;
-    }
-
-    const created = await Scene.create(prepared);
-    if (!created) {
-        throw new Error(`Nie udało się utworzyć sceny "${sceneMeta.name}".`);
-    }
-
-    ui.notifications.info(`Zaimportowano scenę do świata: ${created.name}`);
-    return created;
+    ui.compendium?.render(true);
+    ui.notifications.info(`Dodano wariant "${sceneMeta.name}" do kompendium "${getCleanPackTitle(pack)}".`);
+    return createdDocs?.[0] || null;
 }
 
+/**
+ * Usuwa kompendium paczki ze świata
+ */
 async function deletePackCompendium(pack) {
     const compendium = findPackCompendium(pack);
     if (!compendium) return;
@@ -540,7 +558,8 @@ async function deletePackCompendium(pack) {
         await compendium.configure({ locked: false });
     }
     await compendium.deleteCompendium();
-    ui.notifications.info(`Usunięto kompendium "${pack.title}".`);
+    ui.compendium?.render(true);
+    ui.notifications.info(`Usunięto kompendium "${getCleanPackTitle(pack)}".`);
 }
 
 /* -------------------------------------------- */
@@ -696,6 +715,7 @@ class HomelabMapBrowser extends BaseApp {
 
         try {
             await loadCatalog();
+            await preloadModuleCompendiumIndexes();
         } catch (err) {
             wrapper.innerHTML = `
             <div class="zmb-empty">
@@ -776,6 +796,7 @@ class HomelabMapBrowser extends BaseApp {
         refreshBtn.addEventListener("click", async () => {
             try {
                 await loadCatalog(true);
+                await preloadModuleCompendiumIndexes();
                 this.refreshGridOnly();
                 ui.notifications.info("Odświeżono katalog z serwera.");
             } catch (err) {
@@ -813,8 +834,12 @@ class HomelabMapBrowser extends BaseApp {
         for (const pack of packs) {
             if (this.filterCategory !== "all" && pack.category !== this.filterCategory) continue;
 
+            const cleanTitle = getCleanPackTitle(pack);
+            const sortKey = getSortKey(pack);
+
             if (this.searchQuery) {
-                const matchTitle = pack.title.toLowerCase().includes(this.searchQuery);
+                const matchTitle = cleanTitle.toLowerCase().includes(this.searchQuery) ||
+                pack.title.toLowerCase().includes(this.searchQuery);
                 const matchId = pack.moduleId.toLowerCase().includes(this.searchQuery);
                 const matchScene = pack.scenes.some(s => (s.name || "").toLowerCase().includes(this.searchQuery));
                 if (!matchTitle && !matchId && !matchScene) continue;
@@ -824,8 +849,15 @@ class HomelabMapBrowser extends BaseApp {
             if (this.filterStatus === "imported" && !status.isImported) continue;
             if (this.filterStatus === "not-imported" && status.isImported) continue;
 
-            filtered.push({ pack, status });
+            filtered.push({ pack, status, cleanTitle, sortKey });
         }
+
+        // Sortowanie wyłącznie po nazwie (Dam mapa i Dam scena są obok siebie, numeracja naturalna)
+        filtered.sort((a, b) => {
+            const cmp = naturalCollator.compare(a.sortKey, b.sortKey);
+            if (cmp !== 0) return cmp;
+            return naturalCollator.compare(a.cleanTitle, b.cleanTitle);
+        });
 
         this.countElement.textContent = `Wyświetlono: ${filtered.length} / ${packs.length}`;
 
@@ -837,23 +869,25 @@ class HomelabMapBrowser extends BaseApp {
         const fragment = document.createDocumentFragment();
         const imagesToQueue = [];
 
-        for (const { pack, status } of filtered) {
+        for (const { pack, status, cleanTitle } of filtered) {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${status.isImported ? "is-imported" : ""}`;
 
-            const cleanTitle = pack.title
-            .replace(/^(Cze and Peku - |Czepeku Scenes - |Czepeku - )/i, "")
-            .trim();
             const versionStr = pack.version ? `v${pack.version}` : "v1.0";
-            const thumbUrl = resolveAssetUrl(baseUrl, pack.cover, pack.moduleId, true);
+            const thumbUrl = resolveAssetUrl(baseUrl, pack.cover, pack.moduleId);
 
-            const statusLabel = status.isImported
-            ? `W kompendium (${status.totalCount})`
-            : "Niezaimportowano";
-            const statusClass = status.isImported ? "imported" : "";
+            let statusLabel = "Niezaimportowano";
+            let statusClass = "";
+            if (status.isFullyImported) {
+                statusLabel = `W kompendium (${status.importedCount}/${status.totalCount})`;
+                statusClass = "imported";
+            } else if (status.isImported) {
+                statusLabel = `Częściowo (${status.importedCount}/${status.totalCount})`;
+                statusClass = "partial";
+            }
 
             tile.innerHTML = `
-            <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze sceny w tej paczce">
+            <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze warianty w tej paczce">
             <img data-src="${thumbUrl}" alt="${cleanTitle}" />
             <div class="zmb-meta-overlay">
             <span class="zmb-tag">${pack.category === "scene" ? "Scena" : "Mapa"} • ${status.totalCount}</span>
@@ -865,8 +899,8 @@ class HomelabMapBrowser extends BaseApp {
             <div class="zmb-title" title="${cleanTitle}">${cleanTitle}</div>
             <div class="zmb-actions">
             <button type="button" class="zmb-import-pack">
-            <i class="fa-solid ${status.isImported ? "fa-book-open" : "fa-file-import"}"></i>
-            ${status.isImported ? "Kompendium" : "Importuj"}
+            <i class="fa-solid ${status.isFullyImported ? "fa-book-open" : "fa-file-import"}"></i>
+            ${status.isFullyImported ? "Kompendium" : "Importuj"}
             </button>
             <button type="button" class="zmb-view-scenes" title="Pokaż pojedyncze warianty">
             <i class="fa-solid fa-folder-open"></i> Warianty
@@ -893,11 +927,7 @@ class HomelabMapBrowser extends BaseApp {
                 });
 
                 tile.querySelector(".zmb-import-pack").addEventListener("click", async (ev) => {
-                    if (status.isImported && status.compendium) {
-                        const compFolder = await getOrCreateCompendiumFolder();
-                        if (compFolder && !status.compendium.folder) {
-                            await assignCompendiumToFolder(status.compendium, compFolder);
-                        }
+                    if (status.isFullyImported && status.compendium) {
                         status.compendium.render(true);
                         return;
                     }
@@ -918,7 +948,7 @@ class HomelabMapBrowser extends BaseApp {
                 tile.querySelector(".zmb-delete-pack")?.addEventListener("click", async () => {
                     const confirmed = await Dialog.confirm({
                         title: "Usuń Kompendium",
-                        content: `<p>Czy na pewno chcesz usunąć kompendium <strong>${cleanTitle}</strong> ze świata?</p>`
+                        content: `<p>Czy na pewno chcesz usunąć kompendium <strong>${cleanTitle}</strong>?</p>`
                     });
                     if (confirmed) {
                         await deletePackCompendium(pack);
@@ -937,11 +967,13 @@ class HomelabMapBrowser extends BaseApp {
 
     _renderScenesView(pack) {
         const baseUrl = getServerUrl();
+        const compendium = findPackCompendium(pack);
 
         this.backButton.style.display = "";
         this.catSelect.style.display = "none";
         this.gridContainer.innerHTML = "";
 
+        const cleanTitle = getCleanPackTitle(pack);
         const versionStr = pack.version ? `v${pack.version}` : "v1.0";
         const scenes = [];
 
@@ -949,27 +981,26 @@ class HomelabMapBrowser extends BaseApp {
             const sName = sceneMeta.name || "Scena";
             if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
-            const worldScene = game.scenes.find(s =>
-            s.getFlag(MODULE_ID, "moduleId") === pack.moduleId &&
-            s.getFlag(MODULE_ID, "sceneId") === sceneMeta.id
-            );
-            const isImported = Boolean(worldScene);
+            // Status wariantu sprawdzany jest wyłącznie w kompendium paczki (nie w game.scenes)
+            const isImported = isVariantInCompendium(compendium, sceneMeta);
 
             if (this.filterStatus === "imported" && !isImported) continue;
             if (this.filterStatus === "not-imported" && isImported) continue;
 
-            scenes.push({ sceneMeta, worldScene, isImported });
+            scenes.push({ sceneMeta, isImported });
         }
 
-        this.countElement.textContent = `${pack.title} (${versionStr}) — Warianty: ${scenes.length}`;
+        scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
+
+        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Warianty: ${scenes.length}`;
 
         const fragment = document.createDocumentFragment();
         const imagesToQueue = [];
 
-        for (const { sceneMeta, worldScene, isImported } of scenes) {
+        for (const { sceneMeta, isImported } of scenes) {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
-            const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId, true);
+            const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId);
             const sceneName = sceneMeta.name || "Scena";
 
             tile.innerHTML = `
@@ -980,17 +1011,17 @@ class HomelabMapBrowser extends BaseApp {
             <span class="zmb-tag">${versionStr}</span>
             </div>
             <div class="zmb-status-bar ${isImported ? "imported" : ""}">
-            ${isImported ? "W świecie" : "Zdalna scena"}
+            ${isImported ? "W kompendium" : "Niezaimportowano"}
             </div>
             </div>
             <div class="zmb-body">
             <div class="zmb-title" title="${sceneName}">${sceneName}</div>
             <div class="zmb-actions">
             <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
-            <i class="fa-solid fa-download"></i> ${isImported ? "W świecie" : "Do świata"}
+            <i class="fa-solid fa-file-import"></i> ${isImported ? "W kompendium" : "Importuj"}
             </button>
-            <button type="button" class="zmb-open-scene">
-            <i class="fa-solid fa-eye"></i> Otwórz
+            <button type="button" class="zmb-open-scene" title="Importuj do kompendium i otwórz kompendium">
+            <i class="fa-solid fa-book-open"></i> Kompendium
             </button>
             </div>
             </div>
@@ -1003,12 +1034,12 @@ class HomelabMapBrowser extends BaseApp {
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
-                    await importSingleSceneToWorld(pack, sceneMeta);
+                    await importSingleVariantToCompendium(pack, sceneMeta);
                     this.refreshGridOnly();
                 } catch (err) {
                     ui.notifications.error(err.message);
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-download"></i> Do świata`;
+                    btn.innerHTML = `<i class="fa-solid fa-file-import"></i> Importuj`;
                 }
             });
 
@@ -1017,14 +1048,15 @@ class HomelabMapBrowser extends BaseApp {
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
-                    const targetScene = await importSingleSceneToWorld(pack, sceneMeta);
+                    await importSingleVariantToCompendium(pack, sceneMeta);
                     this.refreshGridOnly();
-                    if (targetScene) targetScene.view();
+                    const comp = findPackCompendium(pack);
+                    if (comp) comp.render(true);
                 } catch (err) {
                     ui.notifications.error(err.message);
                 } finally {
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-eye"></i> Otwórz`;
+                    btn.innerHTML = `<i class="fa-solid fa-book-open"></i> Kompendium`;
                 }
             });
 
