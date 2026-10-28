@@ -67,9 +67,6 @@ function getServerUrl() {
     return raw.trim().replace(/\/+$/, "");
 }
 
-/**
- * Buduje pełny URL na serwerze map, unikając podwójnego kodowania znaków (np. %20 -> %2520)
- */
 function buildRemoteUrl(baseUrl, relativePath) {
     if (!relativePath) return "icons/svg/adastra.svg";
     if (relativePath.startsWith("http://") || relativePath.startsWith("https://")) {
@@ -104,7 +101,7 @@ async function loadCatalog(force = false) {
 }
 
 /**
- * Buduje szybki indeks O(1) wszystkich zaimportowanych scen w świecie (eliminuje lag przy otwieraniu)
+ * Buduje szybki indeks O(1) wszystkich zaimportowanych scen w świecie
  */
 function buildWorldSceneIndex() {
     const byKey = new Map();
@@ -171,18 +168,69 @@ function rewriteScenePaths(obj, baseUrl) {
 }
 
 /**
- * Konwertuje dane sceny (w tym starszy format v9 z polem "img") do formatu Foundry v12-v14
+ * Konwertuje stare wartości ścian z Foundry v8/v9 (0, 1, 2) na format Foundry v12-v14 (0, 10, 20)
+ */
+function normalizeLegacyWalls(walls) {
+    if (!Array.isArray(walls)) return [];
+
+    const mapSenseValue = (val) => {
+        if (val === 0) return 0;
+        if (val === 1) return 20;
+        if (val === 2) return 10;
+        if ([0, 10, 20, 30, 40].includes(val)) return val;
+        return 20;
+    };
+
+    const mapMoveValue = (val) => {
+        // W Foundry v12-v14 pole "move" akceptuje wyłącznie 0 (NONE) lub 20 (NORMAL)
+        return val === 0 ? 0 : 20;
+    };
+
+    return walls.map(w => {
+        const wall = foundry.utils.deepClone(w);
+        delete wall._id;
+
+        const legacySense = wall.sense;
+        delete wall.sense;
+
+        wall.move = mapMoveValue(wall.move ?? 20);
+        wall.light = mapSenseValue(wall.light ?? legacySense ?? 20);
+        wall.sight = mapSenseValue(wall.sight ?? legacySense ?? 20);
+        wall.sound = mapSenseValue(wall.sound ?? legacySense ?? 20);
+
+        // Upewnij się, że współrzędne c to tablica 4 liczb
+        if (!Array.isArray(wall.c) || wall.c.length !== 4) {
+            return null;
+        }
+        wall.c = wall.c.map(n => Number(n) || 0);
+
+        return wall;
+    }).filter(Boolean);
+}
+
+/**
+ * Przygotowuje i migruje dane sceny (v9 -> v12/v14) oraz podmienia ścieżki na zdalne URL
  */
 function prepareSceneData(raw, pack, meta, folderId, baseUrl) {
     const originalId = raw._id;
     const rawBg = meta?.bg || raw.background?.src || raw.img || null;
     const rawThumb = meta?.thumb || raw.thumb || null;
 
-    const prepared = rewriteScenePaths(foundry.utils.deepClone(raw), baseUrl);
+    // 1. Podmień wszystkie ścieżki "modules/..." na pełny URL serwera jeszcze przed migracją
+    let prepared = rewriteScenePaths(foundry.utils.deepClone(raw), baseUrl);
     delete prepared._id;
-    delete prepared.img;
 
-    // Jawne ustawienie tła sceny w strukturze wymaganej przez Foundry v12-v14
+    // 2. Użyj wbudowanej w Foundry migracji danych (konwertuje strukturę ze starszych wersji)
+    try {
+        if (typeof Scene.migrateData === "function") {
+            prepared = Scene.migrateData(prepared);
+        }
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Ostrzeżenie podczas Scene.migrateData:`, err);
+    }
+
+    // 3. Jawnie ustaw tło sceny w background.src (Foundry v12-v14)
+    delete prepared.img;
     if (rawBg) {
         prepared.background = foundry.utils.mergeObject(
             typeof prepared.background === "object" && prepared.background ? prepared.background : {},
@@ -190,9 +238,15 @@ function prepareSceneData(raw, pack, meta, folderId, baseUrl) {
         );
     }
 
-    // Przepisanie kafelków (overhead/roof tiles) ze starszego pola tile.img na tile.texture.src
+    // 4. Napraw ściany ze starych wersji Foundry (błąd "move: 1 is not a valid choice")
+    if (Array.isArray(prepared.walls)) {
+        prepared.walls = normalizeLegacyWalls(prepared.walls);
+    }
+
+    // 5. Napraw kafelki (overhead/roof tiles) ze starszego formatu
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
+            delete tile._id;
             if (tile.img && !tile.texture?.src) {
                 tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: tile.img });
                 delete tile.img;
@@ -200,12 +254,16 @@ function prepareSceneData(raw, pack, meta, folderId, baseUrl) {
         }
     }
 
-    // Jeśli scena ze starego Foundry miała osobne pole foreground (dach), przenieś je we właściwe miejsce
-    if (typeof prepared.foreground === "string" && prepared.foreground) {
-        prepared.foreground = buildRemoteUrl(baseUrl, prepared.foreground);
+    // 6. Usuń stare _id z pozostałych kolekcji osadzonych, by uniknąć konfliktów walidacji
+    for (const key of ["lights", "sounds", "templates", "tokens", "notes", "drawings"]) {
+        if (Array.isArray(prepared[key])) {
+            for (const item of prepared[key]) {
+                delete item._id;
+            }
+        }
     }
 
-    // Konwersja starego formatu siatki (liczba -> obiekt w Foundry v12+)
+    // 7. Napraw definicję siatki (Grid) ze starego formatu liczbowego na obiekt
     if (typeof prepared.grid === "number") {
         prepared.grid = {
             size: prepared.grid || 100,
@@ -282,13 +340,14 @@ async function importPackToWorld(pack) {
     }
 
     if (browserInstance) browserInstance.isBulkImporting = true;
+    let createdDocs = [];
     try {
-        await Scene.createDocuments(toCreate);
+        createdDocs = await Scene.createDocuments(toCreate);
     } finally {
         if (browserInstance) browserInstance.isBulkImporting = false;
     }
 
-    ui.notifications.info(`Zaimportowano ${toCreate.length} scen z paczki "${pack.title}".`);
+    ui.notifications.info(`Zaimportowano ${createdDocs?.length || toCreate.length} scen z paczki "${pack.title}".`);
 }
 
 async function importSingleSceneToWorld(pack, sceneMeta) {
@@ -309,6 +368,10 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     const prepared = prepareSceneData(raw, pack, sceneMeta, folder.id, baseUrl);
 
     const created = await Scene.create(prepared);
+    if (!created) {
+        throw new Error(`Nie udało się utworzyć sceny "${sceneMeta.name}" (błąd walidacji dokumentu).`);
+    }
+
     ui.notifications.info(`Zaimportowano scenę: ${created.name}`);
     return created;
 }
@@ -369,7 +432,7 @@ class ThumbnailQueue {
                     if (entry.isIntersecting) {
                         const img = entry.target;
                         this.observer.unobserve(img);
-                        this.enqueue(img, true); // Widoczne kafelki ładują się w pierwszej kolejności
+                        this.enqueue(img, true);
                     }
                 }
             },
@@ -616,7 +679,7 @@ class HomelabMapBrowser extends BaseApp {
             if (this.searchQuery) {
                 const matchTitle = pack.title.toLowerCase().includes(this.searchQuery);
                 const matchId = pack.moduleId.toLowerCase().includes(this.searchQuery);
-                const matchScene = pack.scenes.some(s => s.name.toLowerCase().includes(this.searchQuery));
+                const matchScene = pack.scenes.some(s => (s.name || "").toLowerCase().includes(this.searchQuery));
                 if (!matchTitle && !matchId && !matchScene) continue;
             }
 
@@ -742,7 +805,8 @@ class HomelabMapBrowser extends BaseApp {
         const scenes = [];
 
         for (const sceneMeta of pack.scenes) {
-            if (this.searchQuery && !sceneMeta.name.toLowerCase().includes(this.searchQuery)) continue;
+            const sName = sceneMeta.name || "Bez nazwy";
+            if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
             const worldScene = findSceneInIndex(worldIndex, baseUrl, pack.moduleId, sceneMeta.id, sceneMeta.bg);
             const isImported = Boolean(worldScene);
@@ -762,10 +826,11 @@ class HomelabMapBrowser extends BaseApp {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
             const thumbUrl = buildRemoteUrl(baseUrl, sceneMeta.thumb);
+            const sceneName = sceneMeta.name || "Scena";
 
             tile.innerHTML = `
             <div class="zmb-thumb">
-            <img data-src="${thumbUrl}" alt="${sceneMeta.name}" />
+            <img data-src="${thumbUrl}" alt="${sceneName}" />
             <div class="zmb-meta-overlay">
             <span class="zmb-tag">${sceneMeta.width || "?"}×${sceneMeta.height || "?"}</span>
             <span class="zmb-tag">${versionStr}</span>
@@ -775,7 +840,7 @@ class HomelabMapBrowser extends BaseApp {
             </div>
             </div>
             <div class="zmb-body">
-            <div class="zmb-title" title="${sceneMeta.name}">${sceneMeta.name}</div>
+            <div class="zmb-title" title="${sceneName}">${sceneName}</div>
             <div class="zmb-actions">
             <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
             <i class="fa-solid fa-download"></i> ${isImported ? "W świecie" : "Importuj"}
