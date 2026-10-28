@@ -9,7 +9,7 @@ Maps and scene assets stream directly from your remote web server via URL, keepi
 Paste the link below into **Add-on Modules → Install Module → Manifest URL**:
 
 ```
-https://github.com/zychuk/zychu-map-browser/releases/latest/download/module.json
+https://github.com/zychuk/foundry-map-browser/releases/latest/download/module.json
 ```
 
 ## Usage
