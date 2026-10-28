@@ -25,18 +25,8 @@ function resetCachesOnUrlChange() {
 Hooks.once("init", () => {
     game.settings.register(MODULE_ID, "serverUrl", {
         name: "Adres URL serwera map",
-        hint: "Główny adres serwera z plikiem catalog.json (np. https://maps.zychu.org). Bez ukośnika na końcu.",
+        hint: "Pełny adres serwera z plikiem catalog.json (np. https://maps.zychu.org). Bez ukośnika na końcu.",
                            scope: "world",
-                           config: true,
-                           type: String,
-                           default: "",
-                               onChange: resetCachesOnUrlChange
-    });
-
-    game.settings.register(MODULE_ID, "localServerUrl", {
-        name: "Lokalny / alternatywny URL serwera (opcjonalnie)",
-                           hint: "Ustawienie tylko dla Twojej przeglądarki. Pozostaw puste, aby używać głównego adresu świata.",
-                           scope: "client",
                            config: true,
                            type: String,
                            default: "",
@@ -85,8 +75,6 @@ Hooks.on("deleteScene", () => {
 /* -------------------------------------------- */
 
 function getServerUrl() {
-    const localOverride = (game.settings.get(MODULE_ID, "localServerUrl") || "").trim().replace(/\/+$/, "");
-    if (localOverride) return localOverride;
     const raw = game.settings.get(MODULE_ID, "serverUrl") || "";
     return raw.trim().replace(/\/+$/, "");
 }
