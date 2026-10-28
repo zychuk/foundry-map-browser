@@ -1,4 +1,5 @@
 const MODULE_ID = "zychu-map-browser";
+const FOLDER_NAME = "Zychu Maps";
 
 let catalogCache = null;
 let browserInstance = null;
@@ -56,9 +57,11 @@ function getServerUrl() {
 }
 
 /**
- * Bezpiecznie koduje ścieżkę do pełnego URL na serwerze map (bez podwójnego kodowania %20)
+ * Koduje ścieżkę w dwóch wariantach:
+ * - decodeFirst = true: dla ścieżek, które są już częściowo zakodowane URL-em (np. %20 -> spacja na dysku)
+ * - decodeFirst = false: dla ścieżek, które mają dosłowne znaki %20 w nazwie pliku na dysku Linuksa
  */
-function buildRemoteUrl(baseUrl, relativePath) {
+function buildRemoteUrl(baseUrl, relativePath, decodeFirst = true) {
     if (!relativePath || typeof relativePath !== "string") return "";
     const trimmed = relativePath.trim();
     if (!trimmed) return "";
@@ -73,6 +76,7 @@ function buildRemoteUrl(baseUrl, relativePath) {
     const encoded = clean
     .split("/")
     .map(segment => {
+        if (!decodeFirst) return encodeURIComponent(segment);
         try {
             return encodeURIComponent(decodeURIComponent(segment));
         } catch {
@@ -83,25 +87,76 @@ function buildRemoteUrl(baseUrl, relativePath) {
     return `${baseUrl}/${encoded}`;
 }
 
-/**
- * Rozwiązuje dowolną ścieżkę zasobu z paczki (nawet jeśli nie zaczyna się od "modules/")
- */
-function resolveAssetUrl(baseUrl, assetPath, moduleId) {
+function normalizeRelativeModulePath(assetPath, moduleId) {
     if (!assetPath || typeof assetPath !== "string") return "";
-    const trimmed = assetPath.trim();
-    if (!trimmed) return "";
-    if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("data:")) {
-        return trimmed;
+    const clean = assetPath.trim().replace(/^\/+/, "");
+    if (!clean) return "";
+    if (clean.startsWith("http://") || clean.startsWith("https://") || clean.startsWith("data:")) {
+        return clean;
     }
-    if (trimmed.startsWith("icons/") || trimmed.startsWith("ui/")) {
-        return trimmed;
+    if (clean.startsWith("icons/") || clean.startsWith("ui/")) {
+        return clean;
+    }
+    if (clean.startsWith("modules/") || clean.startsWith("thumbs/")) {
+        return clean;
+    }
+    return `modules/${moduleId}/${clean}`;
+}
+
+function resolveAssetUrl(baseUrl, assetPath, moduleId, decodeFirst = true) {
+    const norm = normalizeRelativeModulePath(assetPath, moduleId);
+    if (!norm) return "";
+    return buildRemoteUrl(baseUrl, norm, decodeFirst);
+}
+
+/**
+ * Sprawdza, który wariant kodowania URL (z dekodowaniem %20 lub z dosłownym %20 na dysku)
+ * faktycznie istnieje na serwerze dla danej paczki.
+ */
+async function detectWorkingUrlEncoding(baseUrl, pack, rawScenes) {
+    const firstRaw = rawScenes?.[0];
+    const firstMeta = pack.scenes?.[0];
+    const samplePath = firstMeta?.bg || firstRaw?.background?.src || firstRaw?.img;
+    if (!samplePath) return { decodeFirst: true, forceModulePrefix: false };
+
+    const candidates = [
+        { decodeFirst: true, forceModulePrefix: false },
+        { decodeFirst: false, forceModulePrefix: false },
+        { decodeFirst: true, forceModulePrefix: true },
+        { decodeFirst: false, forceModulePrefix: true }
+    ];
+
+    for (const cand of candidates) {
+        let testRel = normalizeRelativeModulePath(samplePath, pack.moduleId);
+        if (cand.forceModulePrefix && testRel.startsWith("modules/")) {
+            const parts = testRel.split("/");
+            parts[1] = pack.moduleId;
+            testRel = parts.join("/");
+        }
+        const testUrl = buildRemoteUrl(baseUrl, testRel, cand.decodeFirst);
+        try {
+            const resp = await fetch(testUrl, { method: "HEAD" });
+            if (resp.ok) return cand;
+        } catch {
+            // Próbuj kolejny wariant
+        }
     }
 
-    const clean = trimmed.replace(/^\/+/, "");
-    if (clean.startsWith("modules/")) {
-        return buildRemoteUrl(baseUrl, clean);
+    // Jeśli wszystkie zwróciły błąd (np. 404), wypisz czytelne ostrzeżenie w konsoli
+    const defaultUrl = resolveAssetUrl(baseUrl, samplePath, pack.moduleId, true);
+    console.warn(`[${MODULE_ID}] Nie udało się zweryfikować pliku obrazu tła (sprawdź czy plik istnieje na serwerze): ${defaultUrl}`);
+    return { decodeFirst: true, forceModulePrefix: false };
+}
+
+function buildFinalAssetUrl(baseUrl, assetPath, moduleId, encodingStrategy) {
+    if (!assetPath || typeof assetPath !== "string") return "";
+    let rel = normalizeRelativeModulePath(assetPath, moduleId);
+    if (encodingStrategy?.forceModulePrefix && rel.startsWith("modules/")) {
+        const parts = rel.split("/");
+        parts[1] = moduleId;
+        rel = parts.join("/");
     }
-    return buildRemoteUrl(baseUrl, `modules/${moduleId}/${clean}`);
+    return buildRemoteUrl(baseUrl, rel, encodingStrategy ? encodingStrategy.decodeFirst : true);
 }
 
 async function loadCatalog(force = false) {
@@ -119,20 +174,14 @@ async function loadCatalog(force = false) {
 }
 
 /* -------------------------------------------- */
-/*  Zarządzanie Kompendiami (World Compendiums) */
+/*  Zarządzanie Kompendiami i Folderem          */
 /* -------------------------------------------- */
 
-/**
- * Generuje bezpieczną nazwę systemową dla kompendium na podstawie moduleId
- */
 function getCompendiumSlug(moduleId) {
     const slug = moduleId.toLowerCase().replace(/[^a-z0-9-_]/g, "-");
     return `zmb-${slug}`;
 }
 
-/**
- * Znajduje istniejące kompendium w świecie dla danej paczki map
- */
 function findPackCompendium(pack) {
     const expectedName = getCompendiumSlug(pack.moduleId);
     return game.packs.find(p => {
@@ -143,9 +192,6 @@ function findPackCompendium(pack) {
     });
 }
 
-/**
- * Sprawdza status zaimportowania paczki (czy kompendium istnieje w świecie)
- */
 function getPackStatus(pack) {
     const compendium = findPackCompendium(pack);
     const totalCount = pack.sceneCount || pack.scenes.length;
@@ -173,22 +219,46 @@ function getPackStatus(pack) {
 }
 
 /**
- * Znajduje lub tworzy folder "Homelab Maps" w zakładce Compendium Packs
+ * Znajduje lub tworzy folder "Zychu Maps" w zakładce Compendium Packs
+ * (i przemianowuje stary folder "Homelab Maps", jeśli istnieje)
  */
 async function getOrCreateCompendiumFolder() {
-    let folder = game.folders.find(f => f.type === "Compendium" && f.name === "Homelab Maps");
-    if (!folder) {
-        try {
-            folder = await Folder.create({
-                name: "Homelab Maps",
-                type: "Compendium",
-                color: "#2e5a44"
-            });
-        } catch {
-            return null;
-        }
+    let folder = game.folders.find(f => f.type === "Compendium" && f.name === FOLDER_NAME);
+    if (folder) return folder;
+
+    const legacyFolder = game.folders.find(f => f.type === "Compendium" && f.name === "Homelab Maps");
+    if (legacyFolder) {
+        await legacyFolder.update({ name: FOLDER_NAME });
+        return legacyFolder;
     }
-    return folder;
+
+    try {
+        folder = await Folder.create({
+            name: FOLDER_NAME,
+            type: "Compendium",
+            color: "#2e5a44"
+        });
+        return folder;
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Nie udało się utworzyć folderu kompendiów:`, err);
+        return null;
+    }
+}
+
+/**
+ * Przypisuje kompendium do folderu Zychu Maps w Foundry v12-v14
+ */
+async function assignCompendiumToFolder(compendium, folder) {
+    if (!compendium || !folder) return;
+    try {
+        if (typeof compendium.setFolder === "function") {
+            await compendium.setFolder(folder.id);
+        } else if (typeof compendium.configure === "function") {
+            await compendium.configure({ folder: folder.id });
+        }
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Błąd przypisywania kompendium do folderu:`, err);
+    }
 }
 
 /* -------------------------------------------- */
@@ -225,12 +295,9 @@ function normalizeLegacyWalls(walls) {
     }).filter(Boolean);
 }
 
-/**
- * Rekurencyjnie podmienia wszystkie ścieżki plików wewnątrz obiektu sceny
- */
-function rewriteAllPaths(obj, baseUrl, moduleId) {
+function rewriteAllPaths(obj, baseUrl, moduleId, encodingStrategy) {
     if (Array.isArray(obj)) {
-        return obj.map(item => rewriteAllPaths(item, baseUrl, moduleId));
+        return obj.map(item => rewriteAllPaths(item, baseUrl, moduleId, encodingStrategy));
     }
     if (obj && typeof obj === "object") {
         const result = {};
@@ -239,9 +306,9 @@ function rewriteAllPaths(obj, baseUrl, moduleId) {
                 value.startsWith("modules/") ||
                 /\.(webp|png|jpg|jpeg|ogg|mp3|wav|webm|mp4)$/i.test(value)
             )) {
-                result[key] = resolveAssetUrl(baseUrl, value, moduleId);
+                result[key] = buildFinalAssetUrl(baseUrl, value, moduleId, encodingStrategy);
             } else {
-                result[key] = rewriteAllPaths(value, baseUrl, moduleId);
+                result[key] = rewriteAllPaths(value, baseUrl, moduleId, encodingStrategy);
             }
         }
         return result;
@@ -252,24 +319,28 @@ function rewriteAllPaths(obj, baseUrl, moduleId) {
 /**
  * Przygotowuje obiekt sceny z gwarancją poprawnego załadowania obrazu tła (background.src)
  */
-function prepareSceneData(raw, pack, meta, baseUrl) {
+function prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy) {
     const originalId = raw._id;
 
-    // 1. Wyciągnij ścieżkę tła z każdego możliwego miejsca (meta.bg, background.src lub starego img)
+    // 1. Priorytet ma meta.bg z catalog.json (ścieżka zweryfikowana na dysku przy generowaniu miniaturek)
     const rawBgPath =
+    meta?.bg ||
     raw.background?.src ||
     raw.img ||
-    meta?.bg ||
     null;
 
-    const finalBgUrl = rawBgPath ? resolveAssetUrl(baseUrl, rawBgPath, pack.moduleId) : null;
+    const finalBgUrl = rawBgPath
+    ? buildFinalAssetUrl(baseUrl, rawBgPath, pack.moduleId, encodingStrategy)
+    : null;
 
-    // 2. Użyj pełnego obrazu (lub miniaturki) jako podglądu
+    // 2. Miniaturka sceny (z katalogu thumbs/)
     const rawThumbPath = meta?.thumb || raw.thumb || rawBgPath;
-    const finalThumbUrl = rawThumbPath ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId) : null;
+    const finalThumbUrl = rawThumbPath
+    ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId, true)
+    : null;
 
-    // 3. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu jeszcze przed migracją
-    let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId);
+    // 3. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu
+    let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId, encodingStrategy);
     delete prepared._id;
 
     if (finalBgUrl) {
@@ -289,9 +360,9 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // 5. Po migracji twardo wymuś background.src (aby migrator go nie wyczyścił)
-    delete prepared.img;
+    // 5. Po migracji zachowaj zarówno background.src jak i img (aby powtórna migracja w Scene.create nie wyczyściła tła)
     if (finalBgUrl) {
+        prepared.img = finalBgUrl;
         if (typeof prepared.background !== "object" || !prepared.background) {
             prepared.background = {};
         }
@@ -302,19 +373,23 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
         prepared.thumb = finalThumbUrl;
     }
 
+    // Upewnij się, że wymiary sceny są ustawione
+    if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
+    if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
+
     // 6. Napraw ściany ze starych wersji Foundry (move: 1 -> 20)
     if (Array.isArray(prepared.walls)) {
         prepared.walls = normalizeLegacyWalls(prepared.walls);
     }
 
-    // 7. Napraw kafelki (Tiles) i dźwięki
+    // 7. Napraw kafelki (Tiles)
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
             delete tile._id;
             const tileSrc = tile.texture?.src || tile.img;
             if (tileSrc) {
                 tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
-                    src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
+                    src: buildFinalAssetUrl(baseUrl, tileSrc, pack.moduleId, encodingStrategy)
                 });
             }
             delete tile.img;
@@ -357,9 +432,6 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
 /*  Akcje Importu i Usuwania Kompendiów         */
 /* -------------------------------------------- */
 
-/**
- * Tworzy Kompendium w świecie i importuje do niego wszystkie sceny z paczki
- */
 async function importPackAsCompendium(pack) {
     const baseUrl = getServerUrl();
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
@@ -368,21 +440,22 @@ async function importPackAsCompendium(pack) {
     if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
 
     const rawScenes = await res.json();
+    const encodingStrategy = await detectWorkingUrlEncoding(baseUrl, pack, rawScenes);
+
     const cleanTitle = pack.title
     .replace(/^(Cze and Peku - |Czepeku Scenes - |Czepeku - )/i, "")
     .trim();
 
+    const compFolder = await getOrCreateCompendiumFolder();
     let compendium = findPackCompendium(pack);
+
     if (!compendium) {
         const compName = getCompendiumSlug(pack.moduleId);
-        const compFolder = await getOrCreateCompendiumFolder();
-
         compendium = await CompendiumCollection.createCompendium({
             name: compName,
             label: cleanTitle,
             type: "Scene",
             package: "world",
-            folder: compFolder?.id || null,
             flags: {
                 [MODULE_ID]: {
                     moduleId: pack.moduleId,
@@ -392,7 +465,11 @@ async function importPackAsCompendium(pack) {
         });
     }
 
-    // Odblokuj kompendium na czas zapisu
+    // Przypisz kompendium do folderu "Zychu Maps"
+    if (compFolder) {
+        await assignCompendiumToFolder(compendium, compFolder);
+    }
+
     if (compendium.locked) {
         await compendium.configure({ locked: false });
     }
@@ -404,7 +481,7 @@ async function importPackAsCompendium(pack) {
     for (const raw of rawScenes) {
         if (existingNames.has(raw.name)) continue;
         const meta = pack.scenes.find(s => s.id === raw._id);
-        toCreate.push(prepareSceneData(raw, pack, meta, baseUrl));
+        toCreate.push(prepareSceneData(raw, pack, meta, baseUrl, encodingStrategy));
     }
 
     if (toCreate.length > 0) {
@@ -412,22 +489,13 @@ async function importPackAsCompendium(pack) {
         await compendium.getIndex({ fields: ["name", "flags"] });
     }
 
-    ui.notifications.info(`Utworzono kompendium "${cleanTitle}" (${toCreate.length} scen).`);
+    ui.compendium?.render(true);
+    ui.notifications.info(`Utworzono kompendium "${cleanTitle}" w folderze ${FOLDER_NAME} (${toCreate.length} scen).`);
     return compendium;
 }
 
-/**
- * Importuje pojedynczą scenę bezpośrednio do aktywnego świata i zwraca ją
- */
 async function importSingleSceneToWorld(pack, sceneMeta) {
     const baseUrl = getServerUrl();
-
-    // Sprawdź, czy już jest w świecie
-    const existing = game.scenes.find(s =>
-    s.getFlag(MODULE_ID, "moduleId") === pack.moduleId &&
-    s.getFlag(MODULE_ID, "sceneId") === sceneMeta.id
-    );
-    if (existing) return existing;
 
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
     const res = await fetch(scenesUrl);
@@ -437,7 +505,24 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     const raw = rawScenes.find(s => s._id === sceneMeta.id);
     if (!raw) throw new Error("Nie znaleziono wybranej sceny w pliku scenes.json.");
 
-    const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl);
+    const encodingStrategy = await detectWorkingUrlEncoding(baseUrl, pack, [raw]);
+    const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl, encodingStrategy);
+
+    // Jeśli scena jest już w świecie (np. ze starszego importu bez tła), napraw jej background.src
+    const existing = game.scenes.find(s =>
+    s.getFlag(MODULE_ID, "moduleId") === pack.moduleId &&
+    s.getFlag(MODULE_ID, "sceneId") === sceneMeta.id
+    );
+    if (existing) {
+        if (prepared.background?.src && existing.background?.src !== prepared.background.src) {
+            await existing.update({
+                "background.src": prepared.background.src,
+                thumb: prepared.thumb || existing.thumb
+            });
+        }
+        return existing;
+    }
+
     const created = await Scene.create(prepared);
     if (!created) {
         throw new Error(`Nie udało się utworzyć sceny "${sceneMeta.name}".`);
@@ -447,9 +532,6 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     return created;
 }
 
-/**
- * Usuwa kompendium paczki ze świata
- */
 async function deletePackCompendium(pack) {
     const compendium = findPackCompendium(pack);
     if (!compendium) return;
@@ -581,7 +663,7 @@ class HomelabMapBrowser extends BaseApp {
         tag: "div",
         classes: ["zychu-map-browser"],
         window: {
-            title: "Przeglądarka Map (Homelab)",
+            title: "Zychu's Map Browser",
             icon: "fa-solid fa-map",
             resizable: true
         },
@@ -763,7 +845,7 @@ class HomelabMapBrowser extends BaseApp {
             .replace(/^(Cze and Peku - |Czepeku Scenes - |Czepeku - )/i, "")
             .trim();
             const versionStr = pack.version ? `v${pack.version}` : "v1.0";
-            const thumbUrl = resolveAssetUrl(baseUrl, pack.cover, pack.moduleId);
+            const thumbUrl = resolveAssetUrl(baseUrl, pack.cover, pack.moduleId, true);
 
             const statusLabel = status.isImported
             ? `W kompendium (${status.totalCount})`
@@ -812,6 +894,10 @@ class HomelabMapBrowser extends BaseApp {
 
                 tile.querySelector(".zmb-import-pack").addEventListener("click", async (ev) => {
                     if (status.isImported && status.compendium) {
+                        const compFolder = await getOrCreateCompendiumFolder();
+                        if (compFolder && !status.compendium.folder) {
+                            await assignCompendiumToFolder(status.compendium, compFolder);
+                        }
                         status.compendium.render(true);
                         return;
                     }
@@ -883,7 +969,7 @@ class HomelabMapBrowser extends BaseApp {
         for (const { sceneMeta, worldScene, isImported } of scenes) {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
-            const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId);
+            const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId, true);
             const sceneName = sceneMeta.name || "Scena";
 
             tile.innerHTML = `
@@ -931,7 +1017,7 @@ class HomelabMapBrowser extends BaseApp {
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
-                    const targetScene = worldScene || (await importSingleSceneToWorld(pack, sceneMeta));
+                    const targetScene = await importSingleSceneToWorld(pack, sceneMeta);
                     this.refreshGridOnly();
                     if (targetScene) targetScene.view();
                 } catch (err) {
