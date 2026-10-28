@@ -1,0 +1,167 @@
+.zychu-map-browser .window-content {
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    overflow: hidden;
+}
+
+.zmb-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 10px;
+    overflow: hidden;
+}
+
+.zmb-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--color-border-light-primary, #7a7971);
+    flex-shrink: 0;
+}
+
+.zmb-toolbar input[type="search"] {
+    flex: 1;
+    min-width: 180px;
+}
+
+.zmb-toolbar select {
+    width: auto;
+}
+
+.zmb-toolbar button {
+    width: auto;
+    flex: 0 0 auto;
+    padding: 0 10px;
+}
+
+.zmb-count {
+    font-size: var(--font-size-12, 12px);
+    opacity: 0.8;
+    white-space: nowrap;
+    padding: 0 4px;
+}
+
+.zmb-grid {
+    flex: 1;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    align-content: start;
+    padding-right: 4px;
+}
+
+.zmb-tile {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--color-border-light-primary, #7a7971);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.12);
+    overflow: hidden;
+}
+
+.zmb-tile.is-imported {
+    border-color: #2e7d32;
+}
+
+.zmb-thumb {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    background: #111;
+    overflow: hidden;
+    cursor: pointer;
+    border-bottom: 1px solid var(--color-border-light-primary, #7a7971);
+}
+
+.zmb-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border: none;
+    display: block;
+}
+
+.zmb-meta-overlay {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    right: 4px;
+    display: flex;
+    justify-content: space-between;
+    pointer-events: none;
+    gap: 4px;
+}
+
+.zmb-tag {
+    background: rgba(0, 0, 0, 0.78);
+    color: #f0f0e0;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    line-height: 1.2;
+}
+
+.zmb-status-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 6px;
+    text-align: center;
+    background: rgba(0, 0, 0, 0.75);
+    color: #ccc;
+}
+
+.zmb-status-bar.imported {
+    background: rgba(30, 110, 40, 0.88);
+    color: #fff;
+}
+
+.zmb-status-bar.partial {
+    background: rgba(180, 110, 0, 0.88);
+    color: #fff;
+}
+
+.zmb-body {
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.zmb-title {
+    font-weight: bold;
+    font-size: var(--font-size-13, 13px);
+    line-height: 1.25;
+    word-break: break-word;
+}
+
+.zmb-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.zmb-actions button {
+    flex: 1;
+    font-size: var(--font-size-12, 12px);
+    padding: 2px 6px;
+    line-height: 22px;
+}
+
+.zmb-actions button.zmb-icon-btn {
+    flex: 0 0 30px;
+}
+
+.zmb-empty {
+    padding: 30px;
+    text-align: center;
+    opacity: 0.75;
+}
