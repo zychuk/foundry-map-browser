@@ -1,9 +1,9 @@
 const MODULE_ID = "zychu-map-browser";
+const ROOT_SCENE_FOLDER = "Zychu Maps";
 
 let catalogCache = null;
 let browserInstance = null;
 
-// Cache utworzonych katalogów i pobranych plików w bieżącej sesji
 const createdDirsCache = new Set();
 const uploadedAssetsCache = new Map();
 
@@ -16,18 +16,31 @@ const naturalCollator = new Intl.Collator(undefined, {
 /*  Inicjalizacja i ustawienia                  */
 /* -------------------------------------------- */
 
+function resetCachesOnUrlChange() {
+    catalogCache = null;
+    uploadedAssetsCache.clear();
+    if (browserInstance?.rendered) browserInstance.render();
+}
+
 Hooks.once("init", () => {
     game.settings.register(MODULE_ID, "serverUrl", {
         name: "Adres URL serwera map",
-        hint: "Pełny adres serwera z plikiem catalog.json (np. https://maps.example.com). Bez ukośnika na końcu.",
+        hint: "Główny adres serwera z plikiem catalog.json (np. https://maps.zychu.org). Bez ukośnika na końcu.",
                            scope: "world",
                            config: true,
                            type: String,
                            default: "",
-                               onChange: () => {
-                                   catalogCache = null;
-                                   if (browserInstance?.rendered) browserInstance.render();
-                               }
+                               onChange: resetCachesOnUrlChange
+    });
+
+    game.settings.register(MODULE_ID, "localServerUrl", {
+        name: "Lokalny / alternatywny URL serwera (opcjonalnie)",
+                           hint: "Ustawienie tylko dla Twojej przeglądarki. Pozostaw puste, aby używać głównego adresu świata.",
+                           scope: "client",
+                           config: true,
+                           type: String,
+                           default: "",
+                               onChange: resetCachesOnUrlChange
     });
 });
 
@@ -55,12 +68,12 @@ Hooks.on("renderSceneDirectory", (app, html) => {
     }
 });
 
-// Automatyczne odświeżanie statusu po ręcznym dodaniu/usunięciu sceny w świecie
 Hooks.on("createScene", () => {
     if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
         browserInstance.refreshGridOnly();
     }
 });
+
 Hooks.on("deleteScene", () => {
     if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
         browserInstance.refreshGridOnly();
@@ -72,6 +85,8 @@ Hooks.on("deleteScene", () => {
 /* -------------------------------------------- */
 
 function getServerUrl() {
+    const localOverride = (game.settings.get(MODULE_ID, "localServerUrl") || "").trim().replace(/\/+$/, "");
+    if (localOverride) return localOverride;
     const raw = game.settings.get(MODULE_ID, "serverUrl") || "";
     return raw.trim().replace(/\/+$/, "");
 }
@@ -113,9 +128,6 @@ function buildRemoteUrl(baseUrl, relativePath) {
     return `${baseUrl}/${encoded}`;
 }
 
-/**
- * Rozwiązuje zdalny adres URL na serwerze map, wymuszając poprawny folder modułu (modules/<pack.moduleId>/...)
- */
 function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     if (!assetPath || typeof assetPath !== "string") return "";
     const trimmed = assetPath.trim();
@@ -141,6 +153,64 @@ function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     return buildRemoteUrl(baseUrl, `modules/${moduleId}/${clean}`);
 }
 
+/**
+ * Dynamicznie zlicza liczbę scen w module w czasie działania (sceneCount z JSON-a jest tylko fallbackiem)
+ */
+function getPackTotalCount(pack) {
+    if (Array.isArray(pack.scenes)) {
+        return pack.scenes.length;
+    }
+    return Number(pack.sceneCount) || 0;
+}
+
+/**
+ * Zwraca uporządkowaną listę kandydatów URL na miniaturkę katalogu:
+ * 1. Jawnie podana ścieżka pack.cover w catalog.json ma pierwszeństwo.
+ * 2. Fallback: kolejne pliki miniaturek (lub teł) ze scen wewnątrz modułu.
+ */
+function getPackCoverCandidates(baseUrl, pack) {
+    const candidates = [];
+    const seen = new Set();
+
+    const addCandidate = (relPath) => {
+        if (!relPath) return;
+        const url = resolveAssetUrl(baseUrl, relPath, pack.moduleId);
+        if (url && !seen.has(url)) {
+            seen.add(url);
+            candidates.push(url);
+        }
+    };
+
+    if (pack.cover) {
+        addCandidate(pack.cover);
+    }
+
+    if (Array.isArray(pack.scenes)) {
+        for (const s of pack.scenes) {
+            addCandidate(s.thumb);
+            addCandidate(s.bg);
+        }
+    }
+
+    return candidates;
+}
+
+/**
+ * Zwraca główny URL miniatury pojedynczej sceny oraz listę zapasową (np. pełny obraz tła)
+ */
+function getSceneThumbCandidates(baseUrl, pack, sceneMeta) {
+    const candidates = [];
+    if (sceneMeta.thumb) {
+        const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId);
+        if (thumbUrl) candidates.push(thumbUrl);
+    }
+    if (sceneMeta.bg) {
+        const bgUrl = resolveAssetUrl(baseUrl, sceneMeta.bg, pack.moduleId);
+        if (bgUrl && !candidates.includes(bgUrl)) candidates.push(bgUrl);
+    }
+    return candidates;
+}
+
 async function loadCatalog(force = false) {
     const baseUrl = getServerUrl();
     if (!baseUrl) return null;
@@ -159,16 +229,12 @@ async function loadCatalog(force = false) {
 /*  Pobieranie plików do folderu świata         */
 /* -------------------------------------------- */
 
-/**
- * Tworzy hierarchię katalogów wewnątrz worlds/<worldId>/zychu-maps/...
- */
 async function ensureWorldDirectory(targetDir) {
     if (createdDirsCache.has(targetDir)) return;
 
     const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
     const parts = targetDir.split("/").filter(Boolean);
 
-    // Katalog "worlds/<worldId>" już istnieje, więc zaczynamy tworzenie od 3. członu ("zychu-maps/...")
     let current = parts.slice(0, 2).join("/");
     for (let i = 2; i < parts.length; i++) {
         current = `${current}/${parts[i]}`;
@@ -176,15 +242,12 @@ async function ensureWorldDirectory(targetDir) {
         try {
             await FP.createDirectory("data", current);
         } catch {
-            // Ignoruj błąd, jeśli katalog już istnieje
+            // Folder już istnieje
         }
         createdDirsCache.add(current);
     }
 }
 
-/**
- * Pobiera plik z serwera map i zapisuje go lokalnie w worlds/<worldId>/zychu-maps/<moduleId>/...
- */
 async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint = "maps") {
     if (!assetPath || typeof assetPath !== "string") return "";
     const trimmed = assetPath.trim();
@@ -208,7 +271,6 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
         // Zostaw oryginał
     }
 
-    // Oczyść nazwę pliku ze spacji i znaków specjalnych
     const cleanFileName = decodedFileName.replace(/\s+/g, "_");
     const safeModuleDir = moduleId.replace(/[^a-zA-Z0-9-_]/g, "_");
     const targetDir = `worlds/${game.world.id}/zychu-maps/${safeModuleDir}/${subFolderHint}`;
@@ -232,12 +294,9 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
 }
 
 /* -------------------------------------------- */
-/*  Indeksowanie i sprawdzanie statusu w świecie*/
+/*  Indeksowanie i Hierarchia Folderów Scen     */
 /* -------------------------------------------- */
 
-/**
- * Buduje szybki indeks O(1) wszystkich scen znajdujących się aktualnie w świecie (game.scenes)
- */
 function buildWorldSceneIndex() {
     const byKey = new Map();
     for (const s of game.scenes) {
@@ -255,35 +314,54 @@ function findWorldScene(worldIndex, moduleId, sceneId) {
 }
 
 function getPackStatus(pack, worldIndex) {
+    const scenes = Array.isArray(pack.scenes) ? pack.scenes : [];
     let importedCount = 0;
-    for (const s of pack.scenes) {
+
+    for (const s of scenes) {
         if (findWorldScene(worldIndex, pack.moduleId, s.id)) {
             importedCount++;
         }
     }
-    const totalCount = pack.sceneCount || pack.scenes.length;
+
+    const totalCount = getPackTotalCount(pack);
     return {
         importedCount,
         totalCount,
         isImported: importedCount > 0,
-        isFullyImported: importedCount >= totalCount
+        isFullyImported: totalCount > 0 && importedCount >= totalCount
     };
 }
 
-/**
- * Znajduje lub tworzy folder dla danej paczki w zakładce Sceny
- */
 async function getOrCreateSceneFolder(pack) {
-    const cleanName = getCleanPackTitle(pack);
-
-    let folder = game.folders.find(
-        f => f.type === "Scene" && (f.getFlag(MODULE_ID, "moduleId") === pack.moduleId || f.name === cleanName)
+    let rootFolder = game.folders.find(
+        f => f.type === "Scene" && !f.folder && (f.getFlag(MODULE_ID, "isRoot") || f.name === ROOT_SCENE_FOLDER)
     );
 
-    if (!folder) {
-        folder = await Folder.create({
+    if (!rootFolder) {
+        rootFolder = await Folder.create({
+            name: ROOT_SCENE_FOLDER,
+            type: "Scene",
+            folder: null,
+            color: "#2e5a44",
+            flags: {
+                [MODULE_ID]: { isRoot: true }
+            }
+        });
+    }
+
+    const cleanName = getCleanPackTitle(pack);
+    let packFolder = game.folders.find(
+        f => f.type === "Scene" &&
+        f.id !== rootFolder.id &&
+        (f.getFlag(MODULE_ID, "moduleId") === pack.moduleId ||
+        (f.name === cleanName && f.folder?.id === rootFolder.id))
+    );
+
+    if (!packFolder) {
+        packFolder = await Folder.create({
             name: cleanName,
             type: "Scene",
+            folder: rootFolder.id,
             flags: {
                 [MODULE_ID]: {
                     moduleId: pack.moduleId,
@@ -291,12 +369,15 @@ async function getOrCreateSceneFolder(pack) {
                 }
             }
         });
+    } else if (packFolder.folder?.id !== rootFolder.id) {
+        await packFolder.update({ folder: rootFolder.id });
     }
-    return folder;
+
+    return packFolder;
 }
 
 /* -------------------------------------------- */
-/*  Konwersja i naprawa danych Sceny (v9 -> v14)*/
+/*  Konwersja i naprawa danych Sceny            */
 /* -------------------------------------------- */
 
 function ensureValidId(id) {
@@ -334,15 +415,11 @@ function normalizeLegacyWalls(walls) {
     }).filter(Boolean);
 }
 
-/**
- * Pobiera obrazy sceny do folderu świata i przygotowuje obiekt dokumentu dla Foundry v12-v14
- */
 async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUrl) {
     const originalId = raw._id;
     const prepared = foundry.utils.deepClone(raw);
     delete prepared._id;
 
-    // 1. Ustal ścieżkę głównego tła (priorytet ma meta.bg z catalog.json) i pobierz plik do świata
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
@@ -354,7 +431,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         localBgPath = await downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps");
     }
 
-    // 2. Pobierz miniaturkę sceny do świata (aby lista scen działała offline)
     const rawThumbPath = meta?.thumb || raw.thumb || null;
     let localThumbPath = localBgPath;
     if (rawThumbPath) {
@@ -370,7 +446,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     (typeof raw.bgColor === "string" && raw.bgColor) ||
     "#000000";
 
-    // 3. Napraw wymiary i strukturę siatki z Foundry v9 (zanim uruchomimy Scene.migrateData!)
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
@@ -391,12 +466,10 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         delete prepared.gridAlpha;
     }
 
-    // 4. Napraw ściany (move: 1 -> 20)
     if (Array.isArray(prepared.walls)) {
         prepared.walls = normalizeLegacyWalls(prepared.walls);
     }
 
-    // 5. Pobierz kafelki (Tiles / dachy) lokalnie do folderu świata
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
             tile._id = ensureValidId(tile._id);
@@ -415,7 +488,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     }
 
-    // 6. Pobierz ewentualny obraz foreground (dachy z v9)
     if (typeof prepared.foreground === "string" && prepared.foreground) {
         try {
             prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
@@ -432,7 +504,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     }
 
-    // 7. Ustaw tło przed migracją
     delete prepared.img;
     delete prepared.bgColor;
     prepared.backgroundColor = bgColor;
@@ -441,7 +512,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         { src: localBgPath }
     );
 
-    // 8. Przepuść przez natywny migrator Foundry (w v14 utworzy on poprawnie Initial Level)
     try {
         if (typeof Scene.migrateData === "function") {
             const migrated = Scene.migrateData(prepared);
@@ -451,7 +521,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // 9. Jawnie wymuś lokalną ścieżkę tła w background.src oraz w kolekcji levels (Foundry v14)
     if (localBgPath) {
         prepared.background = foundry.utils.mergeObject(
             typeof prepared.background === "object" && prepared.background ? prepared.background : {},
@@ -502,9 +571,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     return prepared;
 }
 
-/**
- * Upewnia się, że po utworzeniu sceny w Foundry v14 jej poziom (Level) ma przypisaną ścieżkę tła
- */
 async function ensureCreatedScenesHaveLevelBg(createdDocs) {
     if (!Array.isArray(createdDocs)) return;
     for (const sceneDoc of createdDocs) {
@@ -526,9 +592,6 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
 /*  Akcje Importu do Świata                     */
 /* -------------------------------------------- */
 
-/**
- * Pobiera pliki i importuje wszystkie brakujące sceny z paczki do świata
- */
 async function importPackToWorld(pack, onProgress = null) {
     const baseUrl = getServerUrl();
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
@@ -538,16 +601,18 @@ async function importPackToWorld(pack, onProgress = null) {
 
     const rawScenes = await res.json();
     const worldIndex = buildWorldSceneIndex();
+    const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
 
     const missingItems = [];
     for (let i = 0; i < rawScenes.length; i++) {
         const raw = rawScenes[i];
         const meta =
-        pack.scenes.find(s => s.id === raw._id) ||
-        pack.scenes.find(s => s.name === raw.name) ||
-        pack.scenes[i];
+        packScenes.find(s => s.id === raw._id) ||
+        packScenes.find(s => s.name === raw.name);
 
-        const sceneId = meta?.id || raw._id;
+        if (!meta) continue;
+
+        const sceneId = meta.id || raw._id;
         if (findWorldScene(worldIndex, pack.moduleId, sceneId)) continue;
         missingItems.push({ raw, meta });
     }
@@ -559,12 +624,22 @@ async function importPackToWorld(pack, onProgress = null) {
 
     const folder = await getOrCreateSceneFolder(pack);
     const toCreate = [];
+    let skippedCount = 0;
 
     for (let i = 0; i < missingItems.length; i++) {
         if (onProgress) onProgress(i + 1, missingItems.length);
         const { raw, meta } = missingItems[i];
-        const prepared = await prepareSceneDataWithLocalAssets(raw, pack, meta, folder.id, baseUrl);
-        toCreate.push(prepared);
+        try {
+            const prepared = await prepareSceneDataWithLocalAssets(raw, pack, meta, folder.id, baseUrl);
+            toCreate.push(prepared);
+        } catch (err) {
+            skippedCount++;
+            console.warn(`[${MODULE_ID}] Pominięto uszkodzoną scenę "${meta?.name || raw.name}":`, err);
+        }
+    }
+
+    if (toCreate.length === 0) {
+        throw new Error(`Nie udało się pobrać żadnej sceny z paczki "${getCleanPackTitle(pack)}".`);
     }
 
     if (browserInstance) browserInstance.isBulkImporting = true;
@@ -576,12 +651,15 @@ async function importPackToWorld(pack, onProgress = null) {
         if (browserInstance) browserInstance.isBulkImporting = false;
     }
 
-    ui.notifications.info(`Zaimportowano ${createdDocs?.length || toCreate.length} scen z paczki "${getCleanPackTitle(pack)}".`);
+    if (skippedCount > 0) {
+        ui.notifications.warn(
+            `Zaimportowano ${createdDocs?.length || toCreate.length} scen z "${getCleanPackTitle(pack)}" (pominięto ${skippedCount} brakujących plików na serwerze).`
+        );
+    } else {
+        ui.notifications.info(`Zaimportowano ${createdDocs?.length || toCreate.length} scen do Zychu Maps / ${getCleanPackTitle(pack)}.`);
+    }
 }
 
-/**
- * Pobiera plik i importuje pojedynczy wariant sceny do świata
- */
 async function importSingleSceneToWorld(pack, sceneMeta) {
     const worldIndex = buildWorldSceneIndex();
     const existing = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
@@ -700,6 +778,20 @@ class ThumbnailQueue {
             finish();
         };
         img.onerror = () => {
+            if (gen !== this.generation || !img.isConnected) {
+                finish();
+                return;
+            }
+
+            // Jeśli główna miniaturka (np. pack.cover) nie istnieje, wypróbuj pierwszy dostępny plik z listy zapasowej
+            if (Array.isArray(img._fallbacks) && img._fallbacks.length > 0) {
+                const nextUrl = img._fallbacks.shift();
+                img.src = nextUrl;
+                return;
+            }
+
+            img.onload = null;
+            img.onerror = null;
             img.src = "icons/svg/adastra.svg";
             img.classList.add("is-loaded");
             finish();
@@ -886,12 +978,13 @@ class HomelabMapBrowser extends BaseApp {
 
             const cleanTitle = getCleanPackTitle(pack);
             const sortKey = getSortKey(pack);
+            const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
 
             if (this.searchQuery) {
                 const matchTitle = cleanTitle.toLowerCase().includes(this.searchQuery) ||
-                pack.title.toLowerCase().includes(this.searchQuery);
-                const matchId = pack.moduleId.toLowerCase().includes(this.searchQuery);
-                const matchScene = pack.scenes.some(s => (s.name || "").toLowerCase().includes(this.searchQuery));
+                (pack.title || "").toLowerCase().includes(this.searchQuery);
+                const matchId = (pack.moduleId || "").toLowerCase().includes(this.searchQuery);
+                const matchScene = packScenes.some(s => (s.name || "").toLowerCase().includes(this.searchQuery));
                 if (!matchTitle && !matchId && !matchScene) continue;
             }
 
@@ -902,7 +995,6 @@ class HomelabMapBrowser extends BaseApp {
             filtered.push({ pack, status, cleanTitle, sortKey });
         }
 
-        // Sortowanie wyłącznie po nazwie (Dam mapa i Dam scena są obok siebie, numeracja naturalna)
         filtered.sort((a, b) => {
             const cmp = naturalCollator.compare(a.sortKey, b.sortKey);
             if (cmp !== 0) return cmp;
@@ -924,7 +1016,8 @@ class HomelabMapBrowser extends BaseApp {
             tile.className = `zmb-tile ${status.isImported ? "is-imported" : ""}`;
 
             const versionStr = pack.version ? `v${pack.version}` : "v1.0";
-            const thumbUrl = resolveAssetUrl(baseUrl, pack.cover, pack.moduleId);
+            const coverCandidates = getPackCoverCandidates(baseUrl, pack);
+            const primaryThumbUrl = coverCandidates[0] || "icons/svg/adastra.svg";
 
             let statusLabel = "Niezaimportowano";
             let statusClass = "";
@@ -938,7 +1031,7 @@ class HomelabMapBrowser extends BaseApp {
 
             tile.innerHTML = `
             <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze sceny w tej paczce">
-            <img data-src="${thumbUrl}" alt="${cleanTitle}" />
+            <img data-src="${primaryThumbUrl}" alt="${cleanTitle}" />
             <div class="zmb-meta-overlay">
             <span class="zmb-tag">${pack.category === "scene" ? "Scena" : "Mapa"} • ${status.totalCount}</span>
             <span class="zmb-tag">${versionStr}</span>
@@ -959,7 +1052,9 @@ class HomelabMapBrowser extends BaseApp {
             </div>
             `;
 
-            imagesToQueue.push(tile.querySelector("img"));
+            const imgEl = tile.querySelector("img");
+            imgEl._fallbacks = coverCandidates.slice(1);
+            imagesToQueue.push(imgEl);
 
             tile.querySelector(".zmb-thumb").addEventListener("click", () => {
                 this.selectedPack = pack;
@@ -1006,9 +1101,10 @@ class HomelabMapBrowser extends BaseApp {
 
         const cleanTitle = getCleanPackTitle(pack);
         const versionStr = pack.version ? `v${pack.version}` : "v1.0";
+        const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
         const scenes = [];
 
-        for (const sceneMeta of pack.scenes) {
+        for (const sceneMeta of packScenes) {
             const sName = sceneMeta.name || "Scena";
             if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
@@ -1023,7 +1119,7 @@ class HomelabMapBrowser extends BaseApp {
 
         scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
 
-        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Sceny: ${scenes.length}`;
+        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Sceny: ${scenes.length} / ${getPackTotalCount(pack)}`;
 
         const fragment = document.createDocumentFragment();
         const imagesToQueue = [];
@@ -1031,12 +1127,13 @@ class HomelabMapBrowser extends BaseApp {
         for (const { sceneMeta, worldScene, isImported } of scenes) {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
-            const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId);
+            const thumbCandidates = getSceneThumbCandidates(baseUrl, pack, sceneMeta);
+            const primaryThumbUrl = thumbCandidates[0] || "icons/svg/adastra.svg";
             const sceneName = sceneMeta.name || "Scena";
 
             tile.innerHTML = `
             <div class="zmb-thumb">
-            <img data-src="${thumbUrl}" alt="${sceneName}" />
+            <img data-src="${primaryThumbUrl}" alt="${sceneName}" />
             <div class="zmb-meta-overlay">
             <span class="zmb-tag">${sceneMeta.width || "?"}×${sceneMeta.height || "?"}</span>
             <span class="zmb-tag">${versionStr}</span>
@@ -1059,7 +1156,9 @@ class HomelabMapBrowser extends BaseApp {
             </div>
             `;
 
-            imagesToQueue.push(tile.querySelector("img"));
+            const imgEl = tile.querySelector("img");
+            imgEl._fallbacks = thumbCandidates.slice(1);
+            imagesToQueue.push(imgEl);
 
             tile.querySelector(".zmb-import-scene").addEventListener("click", async (ev) => {
                 const btn = ev.currentTarget;
