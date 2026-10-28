@@ -2,6 +2,7 @@
     display: flex;
     flex-direction: column;
     padding: 10px;
+    height: 100%;
     overflow: hidden;
 }
 
@@ -9,6 +10,7 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     gap: 10px;
     overflow: hidden;
 }
@@ -46,21 +48,25 @@
 
 .zmb-grid {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 10px;
+    grid-auto-rows: max-content;
+    gap: 12px;
     align-content: start;
-    padding-right: 4px;
+    padding-right: 6px;
 }
 
 .zmb-tile {
     display: flex;
     flex-direction: column;
+    height: 240px;
+    min-height: 240px;
     border: 1px solid var(--color-border-light-primary, #7a7971);
-    border-radius: 4px;
-    background: rgba(0, 0, 0, 0.12);
-    overflow: hidden;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.2);
+    box-sizing: border-box;
 }
 
 .zmb-tile.is-imported {
@@ -70,10 +76,14 @@
 .zmb-thumb {
     position: relative;
     width: 100%;
-    aspect-ratio: 16 / 10;
-    background: #111;
+    height: 140px;
+    min-height: 140px;
+    flex-shrink: 0;
+    background: #141414;
     overflow: hidden;
     cursor: pointer;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
     border-bottom: 1px solid var(--color-border-light-primary, #7a7971);
 }
 
@@ -83,13 +93,19 @@
     object-fit: cover;
     border: none;
     display: block;
+    opacity: 0;
+    transition: opacity 0.2s ease-in-out;
+}
+
+.zmb-thumb img.is-loaded {
+    opacity: 1;
 }
 
 .zmb-meta-overlay {
     position: absolute;
-    top: 4px;
-    left: 4px;
-    right: 4px;
+    top: 5px;
+    left: 5px;
+    right: 5px;
     display: flex;
     justify-content: space-between;
     pointer-events: none;
@@ -97,7 +113,7 @@
 }
 
 .zmb-tag {
-    background: rgba(0, 0, 0, 0.78);
+    background: rgba(0, 0, 0, 0.82);
     color: #f0f0e0;
     font-size: 11px;
     padding: 2px 6px;
@@ -112,19 +128,19 @@
     right: 0;
     font-size: 11px;
     font-weight: bold;
-    padding: 2px 6px;
+    padding: 3px 6px;
     text-align: center;
-    background: rgba(0, 0, 0, 0.75);
+    background: rgba(0, 0, 0, 0.78);
     color: #ccc;
 }
 
 .zmb-status-bar.imported {
-    background: rgba(30, 110, 40, 0.88);
+    background: rgba(30, 110, 40, 0.9);
     color: #fff;
 }
 
 .zmb-status-bar.partial {
-    background: rgba(180, 110, 0, 0.88);
+    background: rgba(180, 110, 0, 0.9);
     color: #fff;
 }
 
@@ -134,26 +150,34 @@
     flex-direction: column;
     flex: 1;
     justify-content: space-between;
-    gap: 8px;
+    gap: 6px;
+    min-height: 0;
 }
 
 .zmb-title {
     font-weight: bold;
     font-size: var(--font-size-13, 13px);
     line-height: 1.25;
-    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .zmb-actions {
     display: flex;
     gap: 4px;
+    flex-shrink: 0;
 }
 
 .zmb-actions button {
     flex: 1;
+    height: 28px;
+    line-height: 24px;
     font-size: var(--font-size-12, 12px);
-    padding: 2px 6px;
-    line-height: 22px;
+    padding: 0 6px;
+    white-space: nowrap;
 }
 
 .zmb-actions button.zmb-icon-btn {
