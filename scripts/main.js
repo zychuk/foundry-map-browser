@@ -24,13 +24,13 @@ function resetCachesOnUrlChange() {
 
 Hooks.once("init", () => {
     game.settings.register(MODULE_ID, "serverUrl", {
-        name: "Adres URL serwera map",
-        hint: "Pełny adres serwera z plikiem catalog.json (np. https://maps.zychu.org). Bez ukośnika na końcu.",
-                           scope: "world",
-                           config: true,
-                           type: String,
-                           default: "",
-                               onChange: resetCachesOnUrlChange
+        name: "ZMB.ServerUrlName",
+        hint: "ZMB.ServerUrlHint",
+        scope: "world",
+        config: true,
+        type: String,
+        default: "",
+            onChange: resetCachesOnUrlChange
     });
 });
 
@@ -44,7 +44,7 @@ Hooks.on("renderSceneDirectory", (app, html) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "zmb-open-btn";
-    btn.innerHTML = `<i class="fa-solid fa-map"></i> Przeglądarka Map`;
+    btn.innerHTML = `<i class="fa-solid fa-map"></i> ${game.i18n.localize("ZMB.OpenBrowser")}`;
     btn.addEventListener("click", () => {
         if (!browserInstance) browserInstance = new HomelabMapBrowser();
         browserInstance.render(true);
@@ -141,9 +141,6 @@ function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     return buildRemoteUrl(baseUrl, `modules/${moduleId}/${clean}`);
 }
 
-/**
- * Dynamicznie zlicza liczbę scen w module w czasie działania (sceneCount z JSON-a jest tylko fallbackiem)
- */
 function getPackTotalCount(pack) {
     if (Array.isArray(pack.scenes)) {
         return pack.scenes.length;
@@ -151,11 +148,6 @@ function getPackTotalCount(pack) {
     return Number(pack.sceneCount) || 0;
 }
 
-/**
- * Zwraca uporządkowaną listę kandydatów URL na miniaturkę katalogu:
- * 1. Jawnie podana ścieżka pack.cover w catalog.json ma pierwszeństwo.
- * 2. Fallback: kolejne pliki miniaturek (lub teł) ze scen wewnątrz modułu.
- */
 function getPackCoverCandidates(baseUrl, pack) {
     const candidates = [];
     const seen = new Set();
@@ -183,9 +175,6 @@ function getPackCoverCandidates(baseUrl, pack) {
     return candidates;
 }
 
-/**
- * Zwraca główny URL miniatury pojedynczej sceny oraz listę zapasową (np. pełny obraz tła)
- */
 function getSceneThumbCandidates(baseUrl, pack, sceneMeta) {
     const candidates = [];
     if (sceneMeta.thumb) {
@@ -206,7 +195,7 @@ async function loadCatalog(force = false) {
     if (!catalogCache || force) {
         const response = await fetch(`${baseUrl}/catalog.json`, { cache: "no-cache" });
         if (!response.ok) {
-            throw new Error(`Serwer zwrócił kod HTTP ${response.status}`);
+            throw new Error(game.i18n.format("ZMB.CatalogError", { status: response.status }));
         }
         catalogCache = await response.json();
     }
@@ -585,7 +574,7 @@ async function importPackToWorld(pack, onProgress = null) {
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
 
     const res = await fetch(scenesUrl);
-    if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
+    if (!res.ok) throw new Error(game.i18n.format("ZMB.CatalogError", { status: res.status }));
 
     const rawScenes = await res.json();
     const worldIndex = buildWorldSceneIndex();
@@ -605,8 +594,9 @@ async function importPackToWorld(pack, onProgress = null) {
         missingItems.push({ raw, meta });
     }
 
+    const packTitle = getCleanPackTitle(pack);
     if (missingItems.length === 0) {
-        ui.notifications.info(`Wszystkie sceny z paczki "${getCleanPackTitle(pack)}" są już w świecie.`);
+        ui.notifications.info(game.i18n.format("ZMB.AllScenesImported", { title: packTitle }));
         return;
     }
 
@@ -627,7 +617,7 @@ async function importPackToWorld(pack, onProgress = null) {
     }
 
     if (toCreate.length === 0) {
-        throw new Error(`Nie udało się pobrać żadnej sceny z paczki "${getCleanPackTitle(pack)}".`);
+        throw new Error(`Nie udało się pobrać żadnej sceny z paczki "${packTitle}".`);
     }
 
     if (browserInstance) browserInstance.isBulkImporting = true;
@@ -639,12 +629,11 @@ async function importPackToWorld(pack, onProgress = null) {
         if (browserInstance) browserInstance.isBulkImporting = false;
     }
 
+    const createdCount = createdDocs?.length || toCreate.length;
     if (skippedCount > 0) {
-        ui.notifications.warn(
-            `Zaimportowano ${createdDocs?.length || toCreate.length} scen z "${getCleanPackTitle(pack)}" (pominięto ${skippedCount} brakujących plików na serwerze).`
-        );
+        ui.notifications.warn(game.i18n.format("ZMB.PackImportedWarn", { count: createdCount, title: packTitle, skipped: skippedCount }));
     } else {
-        ui.notifications.info(`Zaimportowano ${createdDocs?.length || toCreate.length} scen do Zychu Maps / ${getCleanPackTitle(pack)}.`);
+        ui.notifications.info(game.i18n.format("ZMB.PackImportedInfo", { count: createdCount, title: packTitle }));
     }
 }
 
@@ -657,7 +646,7 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
 
     const res = await fetch(scenesUrl);
-    if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
+    if (!res.ok) throw new Error(game.i18n.format("ZMB.CatalogError", { status: res.status }));
 
     const rawScenes = await res.json();
     const raw =
@@ -674,7 +663,7 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     }
 
     await ensureCreatedScenesHaveLevelBg([created]);
-    ui.notifications.info(`Zaimportowano scenę: ${created.name}`);
+    ui.notifications.info(game.i18n.format("ZMB.SceneImportedInfo", { name: created.name }));
     return created;
 }
 
@@ -771,7 +760,6 @@ class ThumbnailQueue {
                 return;
             }
 
-            // Jeśli główna miniaturka (np. pack.cover) nie istnieje, wypróbuj pierwszy dostępny plik z listy zapasowej
             if (Array.isArray(img._fallbacks) && img._fallbacks.length > 0) {
                 const nextUrl = img._fallbacks.shift();
                 img.src = nextUrl;
@@ -813,7 +801,7 @@ class HomelabMapBrowser extends BaseApp {
         tag: "div",
         classes: ["zychu-map-browser"],
         window: {
-            title: "Zychu's Map Browser",
+            title: "Zychu.WindowMainTitle",
             icon: "fa-solid fa-map",
             resizable: true
         },
@@ -823,6 +811,11 @@ class HomelabMapBrowser extends BaseApp {
         }
     };
 
+    /** @override */
+    get title() {
+        return game.i18n.localize("ZMB.WindowMainTitle");
+    }
+
     async _renderHTML() {
         const wrapper = document.createElement("div");
         wrapper.className = "zmb-container";
@@ -831,10 +824,10 @@ class HomelabMapBrowser extends BaseApp {
         if (!baseUrl) {
             wrapper.innerHTML = `
             <div class="zmb-empty">
-            <p><strong>Brak skonfigurowanego adresu serwera map.</strong></p>
-            <p>Ustaw adres URL serwera w ustawieniach modułu FoundryVTT.</p>
+            <p><strong>${game.i18n.localize("ZMB.SettingsMissingTitle")}</strong></p>
+            <p>${game.i18n.localize("ZMB.SettingsMissingDesc")}</p>
             <button type="button" class="zmb-open-settings">
-            <i class="fa-solid fa-gear"></i> Otwórz ustawienia modułu
+            <i class="fa-solid fa-gear"></i> ${game.i18n.localize("ZMB.OpenSettingsBtn")}
             </button>
             </div>
             `;
@@ -849,10 +842,10 @@ class HomelabMapBrowser extends BaseApp {
         } catch (err) {
             wrapper.innerHTML = `
             <div class="zmb-empty">
-            <p><strong>Błąd połączenia z serwerem:</strong> ${baseUrl}</p>
+            <p><strong>${game.i18n.localize("ZMB.ConnectionError")}</strong> ${baseUrl}</p>
             <p>${err.message}</p>
             <button type="button" class="zmb-retry">
-            <i class="fa-solid fa-rotate"></i> Spróbuj ponownie
+            <i class="fa-solid fa-rotate"></i> ${game.i18n.localize("ZMB.Retry")}
             </button>
             </div>
             `;
@@ -863,20 +856,20 @@ class HomelabMapBrowser extends BaseApp {
         wrapper.innerHTML = `
         <div class="zmb-toolbar">
         <button type="button" class="zmb-back-btn" style="display:none;">
-        <i class="fa-solid fa-arrow-left"></i> Wróć
+        <i class="fa-solid fa-arrow-left"></i> ${game.i18n.localize("ZMB.Back")}
         </button>
-        <input type="search" class="zmb-search" placeholder="Szukaj po nazwie..." value="${this.searchQuery}" />
-        <select class="zmb-status-filter" title="Filtruj po statusie zaimportowania">
-        <option value="all" ${this.filterStatus === "all" ? "selected" : ""}>Status: Wszystkie</option>
-        <option value="imported" ${this.filterStatus === "imported" ? "selected" : ""}>Zaimportowane</option>
-        <option value="not-imported" ${this.filterStatus === "not-imported" ? "selected" : ""}>Niezaimportowane</option>
+        <input type="search" class="zmb-search" placeholder="${game.i18n.localize("ZMB.SearchPlaceholder")}" value="${this.searchQuery}" />
+        <select class="zmb-status-filter" title="">
+        <option value="all" ${this.filterStatus === "all" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusAll")}</option>
+        <option value="imported" ${this.filterStatus === "imported" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusImported")}</option>
+        <option value="not-imported" ${this.filterStatus === "not-imported" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusNotImported")}</option>
         </select>
-        <select class="zmb-cat-filter" title="Filtruj po typie">
-        <option value="all" ${this.filterCategory === "all" ? "selected" : ""}>Typ: Wszystkie</option>
-        <option value="map" ${this.filterCategory === "map" ? "selected" : ""}>Mapy bitewne</option>
-        <option value="scene" ${this.filterCategory === "scene" ? "selected" : ""}>Sceny</option>
+        <select class="zmb-cat-filter" title="">
+        <option value="all" ${this.filterCategory === "all" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeAll")}</option>
+        <option value="map" ${this.filterCategory === "map" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeBattlemaps")}</option>
+        <option value="scene" ${this.filterCategory === "scene" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeScenes")}</option>
         </select>
-        <button type="button" class="zmb-refresh-btn" title="Odśwież katalog z serwera">
+        <button type="button" class="zmb-refresh-btn" title="${game.i18n.localize("ZMB.RefreshCatalog")}">
         <i class="fa-solid fa-rotate"></i>
         </button>
         <span class="zmb-count"></span>
@@ -927,7 +920,7 @@ class HomelabMapBrowser extends BaseApp {
             try {
                 await loadCatalog(true);
                 this.refreshGridOnly();
-                ui.notifications.info("Odświeżono katalog z serwera.");
+                ui.notifications.info(game.i18n.localize("ZMB.CatalogRefreshed"));
             } catch (err) {
                 ui.notifications.error(err.message);
             }
@@ -989,10 +982,10 @@ class HomelabMapBrowser extends BaseApp {
             return naturalCollator.compare(a.cleanTitle, b.cleanTitle);
         });
 
-        this.countElement.textContent = `Wyświetlono: ${filtered.length} / ${packs.length}`;
+        this.countElement.textContent = `${game.i18n.localize("ZMB.Displayed")}: ${filtered.length} / ${packs.length}`;
 
         if (filtered.length === 0) {
-            this.gridContainer.innerHTML = `<div class="zmb-empty" style="grid-column: 1 / -1;">Brak wyników spełniających kryteria filtrów.</div>`;
+            this.gridContainer.innerHTML = `<div class="zmb-empty" style="grid-column: 1 / -1;">${game.i18n.localize("ZMB.NoResults")}</div>`;
             return;
         }
 
@@ -1007,21 +1000,23 @@ class HomelabMapBrowser extends BaseApp {
             const coverCandidates = getPackCoverCandidates(baseUrl, pack);
             const primaryThumbUrl = coverCandidates[0] || "icons/svg/adastra.svg";
 
-            let statusLabel = "Niezaimportowano";
+            const catLabel = pack.category === "scene" ? game.i18n.localize("ZMB.SceneType") : game.i18n.localize("ZMB.MapType");
+
+            let statusLabel = game.i18n.localize("ZMB.NotImportedLabel");
             let statusClass = "";
             if (status.isFullyImported) {
-                statusLabel = `Zaimportowano (${status.importedCount}/${status.totalCount})`;
+                statusLabel = `${game.i18n.localize("ZMB.ImportedLabel")} (${status.importedCount}/${status.totalCount})`;
                 statusClass = "imported";
             } else if (status.isImported) {
-                statusLabel = `Częściowo (${status.importedCount}/${status.totalCount})`;
+                statusLabel = `${game.i18n.localize("ZMB.PartialLabel")} (${status.importedCount}/${status.totalCount})`;
                 statusClass = "partial";
             }
 
             tile.innerHTML = `
-            <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze sceny w tej paczce">
+            <div class="zmb-thumb">
             <img data-src="${primaryThumbUrl}" alt="${cleanTitle}" />
             <div class="zmb-meta-overlay">
-            <span class="zmb-tag">${pack.category === "scene" ? "Scena" : "Mapa"} • ${status.totalCount}</span>
+            <span class="zmb-tag">${catLabel} • ${status.totalCount}</span>
             <span class="zmb-tag">${versionStr}</span>
             </div>
             <div class="zmb-status-bar ${statusClass}">${statusLabel}</div>
@@ -1031,10 +1026,10 @@ class HomelabMapBrowser extends BaseApp {
             <div class="zmb-actions">
             <button type="button" class="zmb-import-pack" ${status.isFullyImported ? "disabled" : ""}>
             <i class="fa-solid ${status.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
-            ${status.isFullyImported ? "W świecie" : "Importuj"}
+            ${status.isFullyImported ? game.i18n.localize("ZMB.InWorld") : game.i18n.localize("ZMB.Import")}
             </button>
-            <button type="button" class="zmb-view-scenes" title="Pokaż pojedyncze warianty">
-            <i class="fa-solid fa-folder-open"></i> Sceny
+            <button type="button" class="zmb-view-scenes">
+            <i class="fa-solid fa-folder-open"></i> ${game.i18n.localize("ZMB.Scenes")}
             </button>
             </div>
             </div>
@@ -1066,7 +1061,7 @@ class HomelabMapBrowser extends BaseApp {
                 } catch (err) {
                     ui.notifications.error(err.message);
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-file-import"></i> Importuj`;
+                    btn.innerHTML = `<i class="fa-solid fa-file-import"></i> ${game.i18n.localize("ZMB.Import")}`;
                 }
             });
 
@@ -1107,7 +1102,7 @@ class HomelabMapBrowser extends BaseApp {
 
         scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
 
-        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Sceny: ${scenes.length} / ${getPackTotalCount(pack)}`;
+        this.countElement.textContent = `${cleanTitle} (${versionStr}) — ${game.i18n.localize("ZMB.Scenes")}: ${scenes.length} / ${getPackTotalCount(pack)}`;
 
         const fragment = document.createDocumentFragment();
         const imagesToQueue = [];
@@ -1119,6 +1114,8 @@ class HomelabMapBrowser extends BaseApp {
             const primaryThumbUrl = thumbCandidates[0] || "icons/svg/adastra.svg";
             const sceneName = sceneMeta.name || "Scena";
 
+            const itemStatus = isImported ? game.i18n.localize("ZMB.ImportedLabel") : game.i18n.localize("ZMB.NotImportedLabel");
+
             tile.innerHTML = `
             <div class="zmb-thumb">
             <img data-src="${primaryThumbUrl}" alt="${sceneName}" />
@@ -1127,7 +1124,7 @@ class HomelabMapBrowser extends BaseApp {
             <span class="zmb-tag">${versionStr}</span>
             </div>
             <div class="zmb-status-bar ${isImported ? "imported" : ""}">
-            ${isImported ? "Zaimportowano" : "Niezaimportowano"}
+            ${itemStatus}
             </div>
             </div>
             <div class="zmb-body">
@@ -1135,10 +1132,10 @@ class HomelabMapBrowser extends BaseApp {
             <div class="zmb-actions">
             <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
             <i class="fa-solid ${isImported ? "fa-check" : "fa-download"}"></i>
-            ${isImported ? "W świecie" : "Importuj"}
+            ${isImported ? game.i18n.localize("ZMB.InWorld") : game.i18n.localize("ZMB.Import")}
             </button>
             <button type="button" class="zmb-open-scene">
-            <i class="fa-solid fa-eye"></i> Otwórz
+            <i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}
             </button>
             </div>
             </div>
@@ -1158,7 +1155,7 @@ class HomelabMapBrowser extends BaseApp {
                 } catch (err) {
                     ui.notifications.error(err.message);
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-download"></i> Importuj`;
+                    btn.innerHTML = `<i class="fa-solid fa-download"></i> ${game.i18n.localize("ZMB.Import")}`;
                 }
             });
 
@@ -1174,7 +1171,7 @@ class HomelabMapBrowser extends BaseApp {
                     ui.notifications.error(err.message);
                 } finally {
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-eye"></i> Otwórz`;
+                    btn.innerHTML = `<i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}`;
                 }
             });
 
