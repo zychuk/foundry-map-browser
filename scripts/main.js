@@ -1,8 +1,11 @@
 const MODULE_ID = "zychu-map-browser";
-const FOLDER_NAME = "Zychu Maps";
 
 let catalogCache = null;
 let browserInstance = null;
+
+// Cache utworzonych katalogów i pobranych plików w bieżącej sesji
+const createdDirsCache = new Set();
+const uploadedAssetsCache = new Map();
 
 const naturalCollator = new Intl.Collator(undefined, {
     numeric: true,
@@ -28,8 +31,8 @@ Hooks.once("init", () => {
     });
 });
 
-// Przycisk otwierania przeglądarki wyłącznie w katalogu Kompendiów
-Hooks.on("renderCompendiumDirectory", (app, html) => {
+// Przycisk otwierania przeglądarki w katalogu Scen
+Hooks.on("renderSceneDirectory", (app, html) => {
     if (!game.user.isGM) return;
 
     const root = html instanceof HTMLElement ? html : html[0];
@@ -52,9 +55,16 @@ Hooks.on("renderCompendiumDirectory", (app, html) => {
     }
 });
 
-// Automatyczne odświeżanie okna przeglądarki po usunięciu kompendium
-Hooks.on("deleteCompendium", () => {
-    if (browserInstance?.rendered) browserInstance.refreshGridOnly();
+// Automatyczne odświeżanie statusu po ręcznym dodaniu/usunięciu sceny w świecie
+Hooks.on("createScene", () => {
+    if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
+        browserInstance.refreshGridOnly();
+    }
+});
+Hooks.on("deleteScene", () => {
+    if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
+        browserInstance.refreshGridOnly();
+    }
 });
 
 /* -------------------------------------------- */
@@ -104,7 +114,7 @@ function buildRemoteUrl(baseUrl, relativePath) {
 }
 
 /**
- * Rozwiązuje ścieżkę zasobu i wymusza dokładną nazwę folderu modułu na dysku (modules/<pack.moduleId>/...)
+ * Rozwiązuje zdalny adres URL na serwerze map, wymuszając poprawny folder modułu (modules/<pack.moduleId>/...)
  */
 function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     if (!assetPath || typeof assetPath !== "string") return "";
@@ -146,51 +156,113 @@ async function loadCatalog(force = false) {
 }
 
 /* -------------------------------------------- */
-/*  Zarządzanie Kompendiami i Folderem          */
+/*  Pobieranie plików do folderu świata         */
 /* -------------------------------------------- */
 
-function getCompendiumSlug(moduleId) {
-    const slug = moduleId.toLowerCase().replace(/[^a-z0-9-_]/g, "-");
-    return `zmb-${slug}`;
-}
+/**
+ * Tworzy hierarchię katalogów wewnątrz worlds/<worldId>/zychu-maps/...
+ */
+async function ensureWorldDirectory(targetDir) {
+    if (createdDirsCache.has(targetDir)) return;
 
-function findPackCompendium(pack) {
-    const expectedName = getCompendiumSlug(pack.moduleId);
-    return game.packs.find(p => {
-        if (p.documentName !== "Scene") return false;
-        if (p.metadata.name === expectedName) return true;
-        if (p.metadata.flags?.[MODULE_ID]?.moduleId === pack.moduleId) return true;
-        return false;
-    });
-}
+    const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+    const parts = targetDir.split("/").filter(Boolean);
 
-function isVariantInCompendium(compendium, sceneMeta) {
-    if (!compendium || !compendium.index) return false;
-    for (const entry of compendium.index) {
-        if (entry.flags?.[MODULE_ID]?.sceneId === sceneMeta.id) return true;
-        if (entry.name === sceneMeta.name) return true;
+    // Katalog "worlds/<worldId>" już istnieje, więc zaczynamy tworzenie od 3. członu ("zychu-maps/...")
+    let current = parts.slice(0, 2).join("/");
+    for (let i = 2; i < parts.length; i++) {
+        current = `${current}/${parts[i]}`;
+        if (createdDirsCache.has(current)) continue;
+        try {
+            await FP.createDirectory("data", current);
+        } catch {
+            // Ignoruj błąd, jeśli katalog już istnieje
+        }
+        createdDirsCache.add(current);
     }
-    return false;
 }
 
-function getPackStatus(pack) {
-    const compendium = findPackCompendium(pack);
+/**
+ * Pobiera plik z serwera map i zapisuje go lokalnie w worlds/<worldId>/zychu-maps/<moduleId>/...
+ */
+async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint = "maps") {
+    if (!assetPath || typeof assetPath !== "string") return "";
+    const trimmed = assetPath.trim();
+    if (!trimmed || trimmed.startsWith("icons/") || trimmed.startsWith("ui/") || trimmed.startsWith("worlds/")) {
+        return trimmed;
+    }
+
+    const remoteUrl = resolveAssetUrl(baseUrl, trimmed, moduleId);
+    if (!remoteUrl) return "";
+
+    const cacheKey = `${game.world.id}:${remoteUrl}`;
+    if (uploadedAssetsCache.has(cacheKey)) {
+        return uploadedAssetsCache.get(cacheKey);
+    }
+
+    const rawFileName = trimmed.split("/").pop() || "asset.webp";
+    let decodedFileName = rawFileName;
+    try {
+        decodedFileName = decodeURIComponent(rawFileName);
+    } catch {
+        // Zostaw oryginał
+    }
+
+    // Oczyść nazwę pliku ze spacji i znaków specjalnych
+    const cleanFileName = decodedFileName.replace(/\s+/g, "_");
+    const safeModuleDir = moduleId.replace(/[^a-zA-Z0-9-_]/g, "_");
+    const targetDir = `worlds/${game.world.id}/zychu-maps/${safeModuleDir}/${subFolderHint}`;
+
+    await ensureWorldDirectory(targetDir);
+
+    const response = await fetch(remoteUrl);
+    if (!response.ok) {
+        throw new Error(`Nie udało się pobrać pliku (${response.status}): ${remoteUrl}`);
+    }
+
+    const blob = await response.blob();
+    const file = new File([blob], cleanFileName, { type: blob.type || "application/octet-stream" });
+
+    const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+    const uploadRes = await FP.upload("data", targetDir, file, {}, { notify: false });
+
+    const savedPath = uploadRes?.path || `${targetDir}/${cleanFileName}`;
+    uploadedAssetsCache.set(cacheKey, savedPath);
+    return savedPath;
+}
+
+/* -------------------------------------------- */
+/*  Indeksowanie i sprawdzanie statusu w świecie*/
+/* -------------------------------------------- */
+
+/**
+ * Buduje szybki indeks O(1) wszystkich scen znajdujących się aktualnie w świecie (game.scenes)
+ */
+function buildWorldSceneIndex() {
+    const byKey = new Map();
+    for (const s of game.scenes) {
+        const flagMod = s.getFlag(MODULE_ID, "moduleId");
+        const flagScene = s.getFlag(MODULE_ID, "sceneId");
+        if (flagMod && flagScene) {
+            byKey.set(`${flagMod}:${flagScene}`, s);
+        }
+    }
+    return byKey;
+}
+
+function findWorldScene(worldIndex, moduleId, sceneId) {
+    return worldIndex.get(`${moduleId}:${sceneId}`);
+}
+
+function getPackStatus(pack, worldIndex) {
+    let importedCount = 0;
+    for (const s of pack.scenes) {
+        if (findWorldScene(worldIndex, pack.moduleId, s.id)) {
+            importedCount++;
+        }
+    }
     const totalCount = pack.sceneCount || pack.scenes.length;
-
-    if (!compendium) {
-        return {
-            compendium: null,
-            importedCount: 0,
-            totalCount,
-            isImported: false,
-            isFullyImported: false
-        };
-    }
-
-    const importedCount = compendium.index ? compendium.index.size : 0;
-
     return {
-        compendium,
         importedCount,
         totalCount,
         isImported: importedCount > 0,
@@ -198,70 +270,20 @@ function getPackStatus(pack) {
     };
 }
 
-async function preloadModuleCompendiumIndexes() {
-    const promises = [];
-    for (const pack of game.packs) {
-        if (pack.documentName === "Scene" && (
-            pack.metadata.name?.startsWith("zmb-") ||
-            pack.metadata.flags?.[MODULE_ID]
-        )) {
-            promises.push(pack.getIndex({ fields: ["name", "flags"] }).catch(() => {}));
-        }
-    }
-    if (promises.length > 0) {
-        await Promise.all(promises);
-    }
-}
+/**
+ * Znajduje lub tworzy folder dla danej paczki w zakładce Sceny
+ */
+async function getOrCreateSceneFolder(pack) {
+    const cleanName = getCleanPackTitle(pack);
 
-async function getOrCreateCompendiumFolder() {
-    let folder = game.folders.find(f => f.type === "Compendium" && f.name === FOLDER_NAME);
-    if (folder) return folder;
+    let folder = game.folders.find(
+        f => f.type === "Scene" && (f.getFlag(MODULE_ID, "moduleId") === pack.moduleId || f.name === cleanName)
+    );
 
-    const legacyFolder = game.folders.find(f => f.type === "Compendium" && f.name === "Homelab Maps");
-    if (legacyFolder) {
-        await legacyFolder.update({ name: FOLDER_NAME });
-        return legacyFolder;
-    }
-
-    try {
+    if (!folder) {
         folder = await Folder.create({
-            name: FOLDER_NAME,
-            type: "Compendium",
-            color: "#2e5a44"
-        });
-        return folder;
-    } catch (err) {
-        console.warn(`[${MODULE_ID}] Nie udało się utworzyć folderu kompendiów:`, err);
-        return null;
-    }
-}
-
-async function assignCompendiumToFolder(compendium, folder) {
-    if (!compendium || !folder) return;
-    try {
-        if (typeof compendium.setFolder === "function") {
-            await compendium.setFolder(folder.id);
-        } else if (typeof compendium.configure === "function") {
-            await compendium.configure({ folder: folder.id });
-        }
-    } catch (err) {
-        console.warn(`[${MODULE_ID}] Błąd przypisywania kompendium do folderu:`, err);
-    }
-}
-
-async function getOrCreatePackCompendium(pack) {
-    const cleanTitle = getCleanPackTitle(pack);
-    const compFolder = await getOrCreateCompendiumFolder();
-    let compendium = findPackCompendium(pack);
-
-    if (!compendium) {
-        const compName = getCompendiumSlug(pack.moduleId);
-        compendium = await CompendiumCollection.createCompendium({
-            name: compName,
-            label: cleanTitle,
+            name: cleanName,
             type: "Scene",
-            package: "world",
-            folder: compFolder?.id || null,
             flags: {
                 [MODULE_ID]: {
                     moduleId: pack.moduleId,
@@ -270,17 +292,7 @@ async function getOrCreatePackCompendium(pack) {
             }
         });
     }
-
-    if (compFolder && compendium.folder?.id !== compFolder.id) {
-        await assignCompendiumToFolder(compendium, compFolder);
-    }
-
-    if (compendium.locked) {
-        await compendium.configure({ locked: false });
-    }
-
-    await compendium.getIndex({ fields: ["name", "flags"] });
-    return compendium;
+    return folder;
 }
 
 /* -------------------------------------------- */
@@ -322,59 +334,46 @@ function normalizeLegacyWalls(walls) {
     }).filter(Boolean);
 }
 
-function rewriteAllPaths(obj, baseUrl, moduleId) {
-    if (Array.isArray(obj)) {
-        return obj.map(item => rewriteAllPaths(item, baseUrl, moduleId));
-    }
-    if (obj && typeof obj === "object") {
-        const result = {};
-        for (const [key, value] of Object.entries(obj)) {
-            if (typeof value === "string" && (
-                value.startsWith("modules/") ||
-                /\.(webp|png|jpg|jpeg|ogg|mp3|wav|webm|mp4)$/i.test(value)
-            )) {
-                result[key] = resolveAssetUrl(baseUrl, value, moduleId);
-            } else {
-                result[key] = rewriteAllPaths(value, baseUrl, moduleId);
-            }
-        }
-        return result;
-    }
-    return obj;
-}
-
 /**
- * Przygotowuje obiekt sceny z pełnym wsparciem dla Foundry v12, v13 oraz nowego systemu Levels w Foundry v14
+ * Pobiera obrazy sceny do folderu świata i przygotowuje obiekt dokumentu dla Foundry v12-v14
  */
-function prepareSceneData(raw, pack, meta, baseUrl) {
+async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUrl) {
     const originalId = raw._id;
+    const prepared = foundry.utils.deepClone(raw);
+    delete prepared._id;
 
-    // 1. Pobierz ścieżkę tła (priorytet ma meta.bg z catalog.json)
+    // 1. Ustal ścieżkę głównego tła (priorytet ma meta.bg z catalog.json) i pobierz plik do świata
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
     raw.img ||
     null;
 
-    const finalBgUrl = rawBgPath ? resolveAssetUrl(baseUrl, rawBgPath, pack.moduleId) : null;
+    let localBgPath = null;
+    if (rawBgPath) {
+        localBgPath = await downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps");
+    }
 
-    const rawThumbPath = meta?.thumb || raw.thumb || rawBgPath;
-    const finalThumbUrl = rawThumbPath ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId) : null;
+    // 2. Pobierz miniaturkę sceny do świata (aby lista scen działała offline)
+    const rawThumbPath = meta?.thumb || raw.thumb || null;
+    let localThumbPath = localBgPath;
+    if (rawThumbPath) {
+        try {
+            localThumbPath = await downloadAssetToWorld(baseUrl, rawThumbPath, pack.moduleId, "thumbs");
+        } catch {
+            localThumbPath = localBgPath;
+        }
+    }
 
     const bgColor =
     (typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
     (typeof raw.bgColor === "string" && raw.bgColor) ||
     "#000000";
 
-    // 2. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu
-    let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId);
-    delete prepared._id;
-
-    // 3. NAJPIERW napraw strukturę z Foundry v9 do v13 (ZANIM uruchomimy Scene.migrateData dla v14!)
+    // 3. Napraw wymiary i strukturę siatki z Foundry v9 (zanim uruchomimy Scene.migrateData!)
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
-    // Siatka (Grid): w v9 była liczbą (np. 140), co powodowało wywalenie się Scene.migrateData w v14
     if (typeof prepared.grid === "number" || !prepared.grid) {
         const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
         prepared.grid = {
@@ -392,22 +391,36 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
         delete prepared.gridAlpha;
     }
 
-    // Ściany (Walls): napraw move: 1 -> 20 oraz zachowaj poprawne 16-znakowe _id dla migracji poziomów v14
+    // 4. Napraw ściany (move: 1 -> 20)
     if (Array.isArray(prepared.walls)) {
         prepared.walls = normalizeLegacyWalls(prepared.walls);
     }
 
-    // Kafelki (Tiles)
+    // 5. Pobierz kafelki (Tiles / dachy) lokalnie do folderu świata
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
             tile._id = ensureValidId(tile._id);
             const tileSrc = tile.texture?.src || tile.img;
             if (tileSrc) {
-                tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
-                    src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
-                });
+                try {
+                    const localTilePath = await downloadAssetToWorld(baseUrl, tileSrc, pack.moduleId, "tiles");
+                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: localTilePath });
+                } catch {
+                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
+                        src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
+                    });
+                }
             }
             delete tile.img;
+        }
+    }
+
+    // 6. Pobierz ewentualny obraz foreground (dachy z v9)
+    if (typeof prepared.foreground === "string" && prepared.foreground) {
+        try {
+            prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
+        } catch {
+            delete prepared.foreground;
         }
     }
 
@@ -419,39 +432,39 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
         }
     }
 
-    // Ustaw tło w standardzie v12/v13 przed migracją do v14
+    // 7. Ustaw tło przed migracją
     delete prepared.img;
     delete prepared.bgColor;
     prepared.backgroundColor = bgColor;
     prepared.background = foundry.utils.mergeObject(
         typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-        { src: finalBgUrl }
+        { src: localBgPath }
     );
 
-    // 4. Przepuść oczyszczony obiekt v13 przez natywny migrator Foundry (w v14 utworzy on poprawnie Initial Level!)
+    // 8. Przepuść przez natywny migrator Foundry (w v14 utworzy on poprawnie Initial Level)
     try {
         if (typeof Scene.migrateData === "function") {
-            prepared = Scene.migrateData(prepared);
+            const migrated = Scene.migrateData(prepared);
+            Object.assign(prepared, migrated);
         }
     } catch (err) {
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // 5. Wymuś tło zarówno w głównym obiekcie (dla v12/v13), jak i w kolekcji levels (dla Foundry v14!)
-    if (finalBgUrl) {
+    // 9. Jawnie wymuś lokalną ścieżkę tła w background.src oraz w kolekcji levels (Foundry v14)
+    if (localBgPath) {
         prepared.background = foundry.utils.mergeObject(
             typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-            { src: finalBgUrl }
+            { src: localBgPath }
         );
 
-        // Wsparcie dla Foundry v14 Scene Levels (Initial Level / Current Level -> Background Image)
         if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
             for (const lvl of prepared.levels) {
                 lvl._id = ensureValidId(lvl._id);
                 if (!lvl.name) lvl.name = "Initial Level";
                 lvl.background = foundry.utils.mergeObject(
                     typeof lvl.background === "object" && lvl.background ? lvl.background : {},
-                    { src: finalBgUrl, color: bgColor }
+                    { src: localBgPath, color: bgColor }
                 );
             }
         } else if (Scene.schema?.fields?.levels) {
@@ -461,7 +474,7 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
                     _id: levelId,
                     name: "Initial Level",
                     background: {
-                        src: finalBgUrl,
+                        src: localBgPath,
                         color: bgColor
                     }
                 }
@@ -472,8 +485,9 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
         }
     }
 
-    if (finalThumbUrl) {
-        prepared.thumb = finalThumbUrl;
+    prepared.folder = folderId;
+    if (localThumbPath) {
+        prepared.thumb = localThumbPath;
     }
 
     prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
@@ -481,7 +495,7 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
             moduleId: pack.moduleId,
             sceneId: originalId,
             version: pack.version || "1.0.0",
-            bgUrl: finalBgUrl
+            bgPath: localBgPath
         }
     });
 
@@ -489,15 +503,14 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
 }
 
 /**
- * Po utworzeniu dokumentów w Foundry v14 weryfikuje, czy poziom (Level) ma wpisane tło
+ * Upewnia się, że po utworzeniu sceny w Foundry v14 jej poziom (Level) ma przypisaną ścieżkę tła
  */
 async function ensureCreatedScenesHaveLevelBg(createdDocs) {
     if (!Array.isArray(createdDocs)) return;
     for (const sceneDoc of createdDocs) {
-        const expectedBg = sceneDoc.getFlag(MODULE_ID, "bgUrl");
+        const expectedBg = sceneDoc.getFlag(MODULE_ID, "bgPath");
         if (!expectedBg) continue;
 
-        // Sprawdź kolekcję levels w Foundry v14
         const firstLevel = sceneDoc.levels?.contents?.[0];
         if (firstLevel && firstLevel.background?.src !== expectedBg) {
             try {
@@ -510,10 +523,13 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
 }
 
 /* -------------------------------------------- */
-/*  Akcje Importu i Usuwania Kompendiów         */
+/*  Akcje Importu do Świata                     */
 /* -------------------------------------------- */
 
-async function importPackAsCompendium(pack) {
+/**
+ * Pobiera pliki i importuje wszystkie brakujące sceny z paczki do świata
+ */
+async function importPackToWorld(pack, onProgress = null) {
     const baseUrl = getServerUrl();
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
 
@@ -521,9 +537,9 @@ async function importPackAsCompendium(pack) {
     if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
 
     const rawScenes = await res.json();
-    const compendium = await getOrCreatePackCompendium(pack);
+    const worldIndex = buildWorldSceneIndex();
 
-    const toCreate = [];
+    const missingItems = [];
     for (let i = 0; i < rawScenes.length; i++) {
         const raw = rawScenes[i];
         const meta =
@@ -531,35 +547,49 @@ async function importPackAsCompendium(pack) {
         pack.scenes.find(s => s.name === raw.name) ||
         pack.scenes[i];
 
-        if (meta && isVariantInCompendium(compendium, meta)) continue;
-        if (!meta && compendium.index.some(e => e.name === raw.name)) continue;
-
-        toCreate.push(prepareSceneData(raw, pack, meta, baseUrl));
+        const sceneId = meta?.id || raw._id;
+        if (findWorldScene(worldIndex, pack.moduleId, sceneId)) continue;
+        missingItems.push({ raw, meta });
     }
 
-    if (toCreate.length > 0) {
-        const createdDocs = await Scene.createDocuments(toCreate, { pack: compendium.collection });
+    if (missingItems.length === 0) {
+        ui.notifications.info(`Wszystkie sceny z paczki "${getCleanPackTitle(pack)}" są już w świecie.`);
+        return;
+    }
+
+    const folder = await getOrCreateSceneFolder(pack);
+    const toCreate = [];
+
+    for (let i = 0; i < missingItems.length; i++) {
+        if (onProgress) onProgress(i + 1, missingItems.length);
+        const { raw, meta } = missingItems[i];
+        const prepared = await prepareSceneDataWithLocalAssets(raw, pack, meta, folder.id, baseUrl);
+        toCreate.push(prepared);
+    }
+
+    if (browserInstance) browserInstance.isBulkImporting = true;
+    let createdDocs = [];
+    try {
+        createdDocs = await Scene.createDocuments(toCreate);
         await ensureCreatedScenesHaveLevelBg(createdDocs);
-        await compendium.getIndex({ fields: ["name", "flags"] });
+    } finally {
+        if (browserInstance) browserInstance.isBulkImporting = false;
     }
 
-    ui.compendium?.render(true);
-    ui.notifications.info(`Zapisano kompendium "${getCleanPackTitle(pack)}" (${compendium.index.size} scen).`);
-    return compendium;
+    ui.notifications.info(`Zaimportowano ${createdDocs?.length || toCreate.length} scen z paczki "${getCleanPackTitle(pack)}".`);
 }
 
-async function importSingleVariantToCompendium(pack, sceneMeta) {
+/**
+ * Pobiera plik i importuje pojedynczy wariant sceny do świata
+ */
+async function importSingleSceneToWorld(pack, sceneMeta) {
+    const worldIndex = buildWorldSceneIndex();
+    const existing = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
+    if (existing) return existing;
+
     const baseUrl = getServerUrl();
-    const compendium = await getOrCreatePackCompendium(pack);
-
-    const existingEntry = compendium.index.find(
-        e => e.flags?.[MODULE_ID]?.sceneId === sceneMeta.id || e.name === sceneMeta.name
-    );
-    if (existingEntry) {
-        return await compendium.getDocument(existingEntry._id);
-    }
-
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
+
     const res = await fetch(scenesUrl);
     if (!res.ok) throw new Error(`Nie udało się pobrać pliku scenes.json (HTTP ${res.status})`);
 
@@ -569,26 +599,17 @@ async function importSingleVariantToCompendium(pack, sceneMeta) {
     rawScenes.find(s => s.name === sceneMeta.name);
     if (!raw) throw new Error("Nie znaleziono wybranej sceny w pliku scenes.json.");
 
-    const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl);
-    const createdDocs = await Scene.createDocuments([prepared], { pack: compendium.collection });
-    await ensureCreatedScenesHaveLevelBg(createdDocs);
-    await compendium.getIndex({ fields: ["name", "flags"] });
+    const folder = await getOrCreateSceneFolder(pack);
+    const prepared = await prepareSceneDataWithLocalAssets(raw, pack, sceneMeta, folder.id, baseUrl);
 
-    ui.compendium?.render(true);
-    ui.notifications.info(`Dodano wariant "${sceneMeta.name}" do kompendium "${getCleanPackTitle(pack)}".`);
-    return createdDocs?.[0] || null;
-}
-
-async function deletePackCompendium(pack) {
-    const compendium = findPackCompendium(pack);
-    if (!compendium) return;
-
-    if (compendium.locked) {
-        await compendium.configure({ locked: false });
+    const created = await Scene.create(prepared);
+    if (!created) {
+        throw new Error(`Nie udało się utworzyć sceny "${sceneMeta.name}".`);
     }
-    await compendium.deleteCompendium();
-    ui.compendium?.render(true);
-    ui.notifications.info(`Usunięto kompendium "${getCleanPackTitle(pack)}".`);
+
+    await ensureCreatedScenesHaveLevelBg([created]);
+    ui.notifications.info(`Zaimportowano scenę: ${created.name}`);
+    return created;
 }
 
 /* -------------------------------------------- */
@@ -704,6 +725,7 @@ class HomelabMapBrowser extends BaseApp {
         this.countElement = null;
         this.thumbQueue = new ThumbnailQueue(3);
         this.searchTimeout = null;
+        this.isBulkImporting = false;
     }
 
     static DEFAULT_OPTIONS = {
@@ -744,7 +766,6 @@ class HomelabMapBrowser extends BaseApp {
 
         try {
             await loadCatalog();
-            await preloadModuleCompendiumIndexes();
         } catch (err) {
             wrapper.innerHTML = `
             <div class="zmb-empty">
@@ -825,7 +846,6 @@ class HomelabMapBrowser extends BaseApp {
         refreshBtn.addEventListener("click", async () => {
             try {
                 await loadCatalog(true);
-                await preloadModuleCompendiumIndexes();
                 this.refreshGridOnly();
                 ui.notifications.info("Odświeżono katalog z serwera.");
             } catch (err) {
@@ -852,6 +872,7 @@ class HomelabMapBrowser extends BaseApp {
 
     _renderPacksView() {
         const baseUrl = getServerUrl();
+        const worldIndex = buildWorldSceneIndex();
 
         this.backButton.style.display = "none";
         this.catSelect.style.display = "";
@@ -874,13 +895,14 @@ class HomelabMapBrowser extends BaseApp {
                 if (!matchTitle && !matchId && !matchScene) continue;
             }
 
-            const status = getPackStatus(pack);
+            const status = getPackStatus(pack, worldIndex);
             if (this.filterStatus === "imported" && !status.isImported) continue;
             if (this.filterStatus === "not-imported" && status.isImported) continue;
 
             filtered.push({ pack, status, cleanTitle, sortKey });
         }
 
+        // Sortowanie wyłącznie po nazwie (Dam mapa i Dam scena są obok siebie, numeracja naturalna)
         filtered.sort((a, b) => {
             const cmp = naturalCollator.compare(a.sortKey, b.sortKey);
             if (cmp !== 0) return cmp;
@@ -907,7 +929,7 @@ class HomelabMapBrowser extends BaseApp {
             let statusLabel = "Niezaimportowano";
             let statusClass = "";
             if (status.isFullyImported) {
-                statusLabel = `W kompendium (${status.importedCount}/${status.totalCount})`;
+                statusLabel = `Zaimportowano (${status.importedCount}/${status.totalCount})`;
                 statusClass = "imported";
             } else if (status.isImported) {
                 statusLabel = `Częściowo (${status.importedCount}/${status.totalCount})`;
@@ -915,7 +937,7 @@ class HomelabMapBrowser extends BaseApp {
             }
 
             tile.innerHTML = `
-            <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze warianty w tej paczce">
+            <div class="zmb-thumb" title="Kliknij, aby przejrzeć pojedyncze sceny w tej paczce">
             <img data-src="${thumbUrl}" alt="${cleanTitle}" />
             <div class="zmb-meta-overlay">
             <span class="zmb-tag">${pack.category === "scene" ? "Scena" : "Mapa"} • ${status.totalCount}</span>
@@ -926,65 +948,46 @@ class HomelabMapBrowser extends BaseApp {
             <div class="zmb-body">
             <div class="zmb-title" title="${cleanTitle}">${cleanTitle}</div>
             <div class="zmb-actions">
-            <button type="button" class="zmb-import-pack">
-            <i class="fa-solid ${status.isFullyImported ? "fa-book-open" : "fa-file-import"}"></i>
-            ${status.isFullyImported ? "Kompendium" : "Importuj"}
+            <button type="button" class="zmb-import-pack" ${status.isFullyImported ? "disabled" : ""}>
+            <i class="fa-solid ${status.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
+            ${status.isFullyImported ? "W świecie" : "Importuj"}
             </button>
             <button type="button" class="zmb-view-scenes" title="Pokaż pojedyncze warianty">
-            <i class="fa-solid fa-folder-open"></i> Warianty
+            <i class="fa-solid fa-folder-open"></i> Sceny
             </button>
-            ${status.isImported ? `
-                <button type="button" class="zmb-icon-btn zmb-delete-pack" title="Usuń kompendium tej paczki">
-                <i class="fa-solid fa-trash"></i>
-                </button>
-                ` : ""}
-                </div>
-                </div>
-                `;
+            </div>
+            </div>
+            `;
 
-                imagesToQueue.push(tile.querySelector("img"));
+            imagesToQueue.push(tile.querySelector("img"));
 
-                tile.querySelector(".zmb-thumb").addEventListener("click", () => {
-                    this.selectedPack = pack;
-                    this.refreshGridOnly();
-                });
+            tile.querySelector(".zmb-thumb").addEventListener("click", () => {
+                this.selectedPack = pack;
+                this.refreshGridOnly();
+            });
 
-                tile.querySelector(".zmb-view-scenes").addEventListener("click", () => {
-                    this.selectedPack = pack;
-                    this.refreshGridOnly();
-                });
+            tile.querySelector(".zmb-view-scenes").addEventListener("click", () => {
+                this.selectedPack = pack;
+                this.refreshGridOnly();
+            });
 
-                tile.querySelector(".zmb-import-pack").addEventListener("click", async (ev) => {
-                    if (status.isFullyImported && status.compendium) {
-                        status.compendium.render(true);
-                        return;
-                    }
-                    const btn = ev.currentTarget;
-                    btn.disabled = true;
-                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                    try {
-                        const comp = await importPackAsCompendium(pack);
-                        this.refreshGridOnly();
-                        if (comp) comp.render(true);
-                    } catch (err) {
-                        ui.notifications.error(err.message);
-                        btn.disabled = false;
-                        btn.innerHTML = `<i class="fa-solid fa-file-import"></i> Importuj`;
-                    }
-                });
-
-                tile.querySelector(".zmb-delete-pack")?.addEventListener("click", async () => {
-                    const confirmed = await Dialog.confirm({
-                        title: "Usuń Kompendium",
-                        content: `<p>Czy na pewno chcesz usunąć kompendium <strong>${cleanTitle}</strong>?</p>`
+            tile.querySelector(".zmb-import-pack").addEventListener("click", async (ev) => {
+                const btn = ev.currentTarget;
+                btn.disabled = true;
+                btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+                try {
+                    await importPackToWorld(pack, (current, total) => {
+                        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`;
                     });
-                    if (confirmed) {
-                        await deletePackCompendium(pack);
-                        this.refreshGridOnly();
-                    }
-                });
+                    this.refreshGridOnly();
+                } catch (err) {
+                    ui.notifications.error(err.message);
+                    btn.disabled = false;
+                    btn.innerHTML = `<i class="fa-solid fa-file-import"></i> Importuj`;
+                }
+            });
 
-                fragment.appendChild(tile);
+            fragment.appendChild(tile);
         }
 
         this.gridContainer.appendChild(fragment);
@@ -995,7 +998,7 @@ class HomelabMapBrowser extends BaseApp {
 
     _renderScenesView(pack) {
         const baseUrl = getServerUrl();
-        const compendium = findPackCompendium(pack);
+        const worldIndex = buildWorldSceneIndex();
 
         this.backButton.style.display = "";
         this.catSelect.style.display = "none";
@@ -1009,22 +1012,23 @@ class HomelabMapBrowser extends BaseApp {
             const sName = sceneMeta.name || "Scena";
             if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
-            const isImported = isVariantInCompendium(compendium, sceneMeta);
+            const worldScene = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
+            const isImported = Boolean(worldScene);
 
             if (this.filterStatus === "imported" && !isImported) continue;
             if (this.filterStatus === "not-imported" && isImported) continue;
 
-            scenes.push({ sceneMeta, isImported });
+            scenes.push({ sceneMeta, worldScene, isImported });
         }
 
         scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
 
-        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Warianty: ${scenes.length}`;
+        this.countElement.textContent = `${cleanTitle} (${versionStr}) — Sceny: ${scenes.length}`;
 
         const fragment = document.createDocumentFragment();
         const imagesToQueue = [];
 
-        for (const { sceneMeta, isImported } of scenes) {
+        for (const { sceneMeta, worldScene, isImported } of scenes) {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
             const thumbUrl = resolveAssetUrl(baseUrl, sceneMeta.thumb, pack.moduleId);
@@ -1038,17 +1042,18 @@ class HomelabMapBrowser extends BaseApp {
             <span class="zmb-tag">${versionStr}</span>
             </div>
             <div class="zmb-status-bar ${isImported ? "imported" : ""}">
-            ${isImported ? "W kompendium" : "Niezaimportowano"}
+            ${isImported ? "Zaimportowano" : "Niezaimportowano"}
             </div>
             </div>
             <div class="zmb-body">
             <div class="zmb-title" title="${sceneName}">${sceneName}</div>
             <div class="zmb-actions">
             <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
-            <i class="fa-solid fa-file-import"></i> ${isImported ? "W kompendium" : "Importuj"}
+            <i class="fa-solid ${isImported ? "fa-check" : "fa-download"}"></i>
+            ${isImported ? "W świecie" : "Importuj"}
             </button>
-            <button type="button" class="zmb-open-scene" title="Importuj do kompendium i otwórz kompendium">
-            <i class="fa-solid fa-book-open"></i> Kompendium
+            <button type="button" class="zmb-open-scene">
+            <i class="fa-solid fa-eye"></i> Otwórz
             </button>
             </div>
             </div>
@@ -1061,12 +1066,12 @@ class HomelabMapBrowser extends BaseApp {
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
-                    await importSingleVariantToCompendium(pack, sceneMeta);
+                    await importSingleSceneToWorld(pack, sceneMeta);
                     this.refreshGridOnly();
                 } catch (err) {
                     ui.notifications.error(err.message);
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-file-import"></i> Importuj`;
+                    btn.innerHTML = `<i class="fa-solid fa-download"></i> Importuj`;
                 }
             });
 
@@ -1075,15 +1080,14 @@ class HomelabMapBrowser extends BaseApp {
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
-                    await importSingleVariantToCompendium(pack, sceneMeta);
+                    const targetScene = worldScene || (await importSingleSceneToWorld(pack, sceneMeta));
                     this.refreshGridOnly();
-                    const comp = findPackCompendium(pack);
-                    if (comp) comp.render(true);
+                    if (targetScene) targetScene.view();
                 } catch (err) {
                     ui.notifications.error(err.message);
                 } finally {
                     btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-book-open"></i> Kompendium`;
+                    btn.innerHTML = `<i class="fa-solid fa-eye"></i> Otwórz`;
                 }
             });
 
