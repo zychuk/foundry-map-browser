@@ -52,7 +52,7 @@ Hooks.on("renderCompendiumDirectory", (app, html) => {
     }
 });
 
-// Automatyczne odświeżanie okna przeglądarki po usunięciu kompendium w Foundry
+// Automatyczne odświeżanie okna przeglądarki po usunięciu kompendium
 Hooks.on("deleteCompendium", () => {
     if (browserInstance?.rendered) browserInstance.refreshGridOnly();
 });
@@ -66,27 +66,18 @@ function getServerUrl() {
     return raw.trim().replace(/\/+$/, "");
 }
 
-/**
- * Zwraca czystą nazwę paczki (bez prefiksów autora i ze spójnym formatowaniem do sortowania)
- */
 function getCleanPackTitle(pack) {
     return (pack.title || pack.moduleId || "")
     .replace(/^(Cze and Peku\s*-\s*|Czepeku Scenes\s*-\s*|Czepeku\s*-\s*)/i, "")
     .trim();
 }
 
-/**
- * Klucz do sortowania alfabetycznego (ignoruje wiodące numery katalogowe typu "01 - ", aby sortować wyłącznie po nazwie)
- */
 function getSortKey(pack) {
     return getCleanPackTitle(pack)
     .replace(/^\d+\s*[-–.]*\s*/, "")
     .trim();
 }
 
-/**
- * Bezpiecznie koduje ścieżkę do pełnego URL na serwerze map (bez podwójnego kodowania %20)
- */
 function buildRemoteUrl(baseUrl, relativePath) {
     if (!relativePath || typeof relativePath !== "string") return "";
     const trimmed = relativePath.trim();
@@ -113,7 +104,7 @@ function buildRemoteUrl(baseUrl, relativePath) {
 }
 
 /**
- * Rozwiązuje ścieżkę zasobu i wymusza poprawną nazwę folderu modułu na dysku (modules/<pack.moduleId>/...)
+ * Rozwiązuje ścieżkę zasobu i wymusza dokładną nazwę folderu modułu na dysku (modules/<pack.moduleId>/...)
  */
 function resolveAssetUrl(baseUrl, assetPath, moduleId) {
     if (!assetPath || typeof assetPath !== "string") return "";
@@ -163,9 +154,6 @@ function getCompendiumSlug(moduleId) {
     return `zmb-${slug}`;
 }
 
-/**
- * Znajduje istniejące kompendium w świecie dla danej paczki map
- */
 function findPackCompendium(pack) {
     const expectedName = getCompendiumSlug(pack.moduleId);
     return game.packs.find(p => {
@@ -176,9 +164,6 @@ function findPackCompendium(pack) {
     });
 }
 
-/**
- * Sprawdza, czy konkretny wariant sceny znajduje się wewnątrz kompendium danej paczki
- */
 function isVariantInCompendium(compendium, sceneMeta) {
     if (!compendium || !compendium.index) return false;
     for (const entry of compendium.index) {
@@ -188,9 +173,6 @@ function isVariantInCompendium(compendium, sceneMeta) {
     return false;
 }
 
-/**
- * Sprawdza status zaimportowania paczki wyłącznie na podstawie jej Kompendium
- */
 function getPackStatus(pack) {
     const compendium = findPackCompendium(pack);
     const totalCount = pack.sceneCount || pack.scenes.length;
@@ -216,9 +198,6 @@ function getPackStatus(pack) {
     };
 }
 
-/**
- * Ładuje indeksy wszystkich kompendiów stworzonych przez moduł, aby liczby scen były dokładne
- */
 async function preloadModuleCompendiumIndexes() {
     const promises = [];
     for (const pack of game.packs) {
@@ -234,9 +213,6 @@ async function preloadModuleCompendiumIndexes() {
     }
 }
 
-/**
- * Znajduje lub tworzy folder "Zychu Maps" w zakładce Compendium Packs
- */
 async function getOrCreateCompendiumFolder() {
     let folder = game.folders.find(f => f.type === "Compendium" && f.name === FOLDER_NAME);
     if (folder) return folder;
@@ -260,9 +236,6 @@ async function getOrCreateCompendiumFolder() {
     }
 }
 
-/**
- * Przypisuje kompendium do folderu "Zychu Maps"
- */
 async function assignCompendiumToFolder(compendium, folder) {
     if (!compendium || !folder) return;
     try {
@@ -276,9 +249,6 @@ async function assignCompendiumToFolder(compendium, folder) {
     }
 }
 
-/**
- * Pobiera lub tworzy puste kompendium dla danej paczki w folderze "Zychu Maps"
- */
 async function getOrCreatePackCompendium(pack) {
     const cleanTitle = getCleanPackTitle(pack);
     const compFolder = await getOrCreateCompendiumFolder();
@@ -317,6 +287,11 @@ async function getOrCreatePackCompendium(pack) {
 /*  Konwersja i naprawa danych Sceny (v9 -> v14)*/
 /* -------------------------------------------- */
 
+function ensureValidId(id) {
+    if (typeof id === "string" && /^[a-zA-Z0-9]{16}$/.test(id)) return id;
+    return foundry.utils.randomID();
+}
+
 function normalizeLegacyWalls(walls) {
     if (!Array.isArray(walls)) return [];
 
@@ -330,7 +305,7 @@ function normalizeLegacyWalls(walls) {
 
     return walls.map(w => {
         const wall = foundry.utils.deepClone(w);
-        delete wall._id;
+        wall._id = ensureValidId(wall._id);
 
         const legacySense = wall.sense;
         delete wall.sense;
@@ -369,12 +344,12 @@ function rewriteAllPaths(obj, baseUrl, moduleId) {
 }
 
 /**
- * Przygotowuje obiekt sceny z gwarancją poprawnej ścieżki obrazu tła (background.src)
+ * Przygotowuje obiekt sceny z pełnym wsparciem dla Foundry v12, v13 oraz nowego systemu Levels w Foundry v14
  */
 function prepareSceneData(raw, pack, meta, baseUrl) {
     const originalId = raw._id;
 
-    // 1. Bezwzględny priorytet ma meta.bg z catalog.json (zweryfikowana ścieżka na dysku serwera!)
+    // 1. Pobierz ścieżkę tła (priorytet ma meta.bg z catalog.json)
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
@@ -383,55 +358,49 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
 
     const finalBgUrl = rawBgPath ? resolveAssetUrl(baseUrl, rawBgPath, pack.moduleId) : null;
 
-    // 2. Miniaturka sceny
     const rawThumbPath = meta?.thumb || raw.thumb || rawBgPath;
     const finalThumbUrl = rawThumbPath ? resolveAssetUrl(baseUrl, rawThumbPath, pack.moduleId) : null;
 
-    // 3. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu
+    const bgColor =
+    (typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
+    (typeof raw.bgColor === "string" && raw.bgColor) ||
+    "#000000";
+
+    // 2. Klonuj i podmień wszystkie ścieżki wewnątrz obiektu
     let prepared = rewriteAllPaths(foundry.utils.deepClone(raw), baseUrl, pack.moduleId);
     delete prepared._id;
-    delete prepared.img;
 
-    // W Foundry v9 pole "background" bywało stringiem z kolorem HEX (np. "#000000")
-    if (typeof prepared.background !== "object" || !prepared.background) {
-        prepared.background = {};
-    }
-    if (finalBgUrl) {
-        prepared.background.src = finalBgUrl;
-    }
-
-    // 4. Przepuść przez natywny migrator Foundry
-    try {
-        if (typeof Scene.migrateData === "function") {
-            prepared = Scene.migrateData(prepared);
-        }
-    } catch (err) {
-        console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
-    }
-
-    // 5. Po migracji twardo wymuś obiekt background z poprawnym src
-    delete prepared.img;
-    prepared.background = foundry.utils.mergeObject(
-        typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-        { src: finalBgUrl }
-    );
-
-    if (finalThumbUrl) {
-        prepared.thumb = finalThumbUrl;
-    }
-
+    // 3. NAJPIERW napraw strukturę z Foundry v9 do v13 (ZANIM uruchomimy Scene.migrateData dla v14!)
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
-    // 6. Napraw ściany ze starych wersji Foundry (move: 1 -> 20)
+    // Siatka (Grid): w v9 była liczbą (np. 140), co powodowało wywalenie się Scene.migrateData w v14
+    if (typeof prepared.grid === "number" || !prepared.grid) {
+        const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
+        prepared.grid = {
+            size: gridSize || 100,
+            type: prepared.gridType ?? 1,
+            distance: prepared.gridDistance ?? 5,
+            units: prepared.gridUnits || "ft",
+            color: prepared.gridColor || "#000000",
+            alpha: prepared.gridAlpha ?? 0.2
+        };
+        delete prepared.gridType;
+        delete prepared.gridDistance;
+        delete prepared.gridUnits;
+        delete prepared.gridColor;
+        delete prepared.gridAlpha;
+    }
+
+    // Ściany (Walls): napraw move: 1 -> 20 oraz zachowaj poprawne 16-znakowe _id dla migracji poziomów v14
     if (Array.isArray(prepared.walls)) {
         prepared.walls = normalizeLegacyWalls(prepared.walls);
     }
 
-    // 7. Napraw kafelki (Tiles)
+    // Kafelki (Tiles)
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
-            delete tile._id;
+            tile._id = ensureValidId(tile._id);
             const tileSrc = tile.texture?.src || tile.img;
             if (tileSrc) {
                 tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
@@ -445,21 +414,66 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
     for (const key of ["lights", "sounds", "templates", "tokens", "notes", "drawings"]) {
         if (Array.isArray(prepared[key])) {
             for (const item of prepared[key]) {
-                delete item._id;
+                item._id = ensureValidId(item._id);
             }
         }
     }
 
-    // 8. Napraw siatkę (Grid) ze starego formatu liczbowego
-    if (typeof prepared.grid === "number") {
-        prepared.grid = {
-            size: prepared.grid || 100,
-            type: prepared.gridType ?? 1,
-            distance: prepared.gridDistance ?? 5,
-            units: prepared.gridUnits || "ft",
-            color: prepared.gridColor || "#000000",
-            alpha: prepared.gridAlpha ?? 0.2
-        };
+    // Ustaw tło w standardzie v12/v13 przed migracją do v14
+    delete prepared.img;
+    delete prepared.bgColor;
+    prepared.backgroundColor = bgColor;
+    prepared.background = foundry.utils.mergeObject(
+        typeof prepared.background === "object" && prepared.background ? prepared.background : {},
+        { src: finalBgUrl }
+    );
+
+    // 4. Przepuść oczyszczony obiekt v13 przez natywny migrator Foundry (w v14 utworzy on poprawnie Initial Level!)
+    try {
+        if (typeof Scene.migrateData === "function") {
+            prepared = Scene.migrateData(prepared);
+        }
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
+    }
+
+    // 5. Wymuś tło zarówno w głównym obiekcie (dla v12/v13), jak i w kolekcji levels (dla Foundry v14!)
+    if (finalBgUrl) {
+        prepared.background = foundry.utils.mergeObject(
+            typeof prepared.background === "object" && prepared.background ? prepared.background : {},
+            { src: finalBgUrl }
+        );
+
+        // Wsparcie dla Foundry v14 Scene Levels (Initial Level / Current Level -> Background Image)
+        if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
+            for (const lvl of prepared.levels) {
+                lvl._id = ensureValidId(lvl._id);
+                if (!lvl.name) lvl.name = "Initial Level";
+                lvl.background = foundry.utils.mergeObject(
+                    typeof lvl.background === "object" && lvl.background ? lvl.background : {},
+                    { src: finalBgUrl, color: bgColor }
+                );
+            }
+        } else if (Scene.schema?.fields?.levels) {
+            const levelId = foundry.utils.randomID();
+            prepared.levels = [
+                {
+                    _id: levelId,
+                    name: "Initial Level",
+                    background: {
+                        src: finalBgUrl,
+                        color: bgColor
+                    }
+                }
+            ];
+            if ("initialLevel" in Scene.schema.fields) {
+                prepared.initialLevel = levelId;
+            }
+        }
+    }
+
+    if (finalThumbUrl) {
+        prepared.thumb = finalThumbUrl;
     }
 
     prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
@@ -474,13 +488,31 @@ function prepareSceneData(raw, pack, meta, baseUrl) {
     return prepared;
 }
 
+/**
+ * Po utworzeniu dokumentów w Foundry v14 weryfikuje, czy poziom (Level) ma wpisane tło
+ */
+async function ensureCreatedScenesHaveLevelBg(createdDocs) {
+    if (!Array.isArray(createdDocs)) return;
+    for (const sceneDoc of createdDocs) {
+        const expectedBg = sceneDoc.getFlag(MODULE_ID, "bgUrl");
+        if (!expectedBg) continue;
+
+        // Sprawdź kolekcję levels w Foundry v14
+        const firstLevel = sceneDoc.levels?.contents?.[0];
+        if (firstLevel && firstLevel.background?.src !== expectedBg) {
+            try {
+                await firstLevel.update({ "background.src": expectedBg });
+            } catch (err) {
+                console.warn(`[${MODULE_ID}] Nie udało się zaktualizować tła poziomu:`, err);
+            }
+        }
+    }
+}
+
 /* -------------------------------------------- */
 /*  Akcje Importu i Usuwania Kompendiów         */
 /* -------------------------------------------- */
 
-/**
- * Tworzy Kompendium w folderze "Zychu Maps" i importuje do niego wszystkie brakujące sceny z paczki
- */
 async function importPackAsCompendium(pack) {
     const baseUrl = getServerUrl();
     const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
@@ -492,10 +524,12 @@ async function importPackAsCompendium(pack) {
     const compendium = await getOrCreatePackCompendium(pack);
 
     const toCreate = [];
-    for (const raw of rawScenes) {
+    for (let i = 0; i < rawScenes.length; i++) {
+        const raw = rawScenes[i];
         const meta =
         pack.scenes.find(s => s.id === raw._id) ||
-        pack.scenes.find(s => s.name === raw.name);
+        pack.scenes.find(s => s.name === raw.name) ||
+        pack.scenes[i];
 
         if (meta && isVariantInCompendium(compendium, meta)) continue;
         if (!meta && compendium.index.some(e => e.name === raw.name)) continue;
@@ -504,7 +538,8 @@ async function importPackAsCompendium(pack) {
     }
 
     if (toCreate.length > 0) {
-        await Scene.createDocuments(toCreate, { pack: compendium.collection });
+        const createdDocs = await Scene.createDocuments(toCreate, { pack: compendium.collection });
+        await ensureCreatedScenesHaveLevelBg(createdDocs);
         await compendium.getIndex({ fields: ["name", "flags"] });
     }
 
@@ -513,14 +548,10 @@ async function importPackAsCompendium(pack) {
     return compendium;
 }
 
-/**
- * Importuje pojedynczy wariant do Kompendium danej paczki (zamiast bezpośrednio do świata)
- */
 async function importSingleVariantToCompendium(pack, sceneMeta) {
     const baseUrl = getServerUrl();
     const compendium = await getOrCreatePackCompendium(pack);
 
-    // Jeśli wariant już jest w kompendium, zwróć go
     const existingEntry = compendium.index.find(
         e => e.flags?.[MODULE_ID]?.sceneId === sceneMeta.id || e.name === sceneMeta.name
     );
@@ -540,6 +571,7 @@ async function importSingleVariantToCompendium(pack, sceneMeta) {
 
     const prepared = prepareSceneData(raw, pack, sceneMeta, baseUrl);
     const createdDocs = await Scene.createDocuments([prepared], { pack: compendium.collection });
+    await ensureCreatedScenesHaveLevelBg(createdDocs);
     await compendium.getIndex({ fields: ["name", "flags"] });
 
     ui.compendium?.render(true);
@@ -547,9 +579,6 @@ async function importSingleVariantToCompendium(pack, sceneMeta) {
     return createdDocs?.[0] || null;
 }
 
-/**
- * Usuwa kompendium paczki ze świata
- */
 async function deletePackCompendium(pack) {
     const compendium = findPackCompendium(pack);
     if (!compendium) return;
@@ -852,7 +881,6 @@ class HomelabMapBrowser extends BaseApp {
             filtered.push({ pack, status, cleanTitle, sortKey });
         }
 
-        // Sortowanie wyłącznie po nazwie (Dam mapa i Dam scena są obok siebie, numeracja naturalna)
         filtered.sort((a, b) => {
             const cmp = naturalCollator.compare(a.sortKey, b.sortKey);
             if (cmp !== 0) return cmp;
@@ -981,7 +1009,6 @@ class HomelabMapBrowser extends BaseApp {
             const sName = sceneMeta.name || "Scena";
             if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
-            // Status wariantu sprawdzany jest wyłącznie w kompendium paczki (nie w game.scenes)
             const isImported = isVariantInCompendium(compendium, sceneMeta);
 
             if (this.filterStatus === "imported" && !isImported) continue;
