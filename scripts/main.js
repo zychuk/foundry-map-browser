@@ -6,9 +6,19 @@ let catalogCache = null;
 let browserInstance = null;
 
 const scenesJsonCache = new Map();
-const dirEnsurePromises = new Map();
+const createdDirsCache = new Set();
 const existingWorldFilesCache = new Set();
 const uploadedAssetsCache = new Map();
+
+// Globalna kolejka operacji plikowych na serwerze Foundry (zapobiega równoczesnym uploadom i segfaultom Node.js)
+let serverOpQueue = Promise.resolve();
+function enqueueServerOp(fn) {
+    const next = serverOpQueue.then(fn, fn);
+    serverOpQueue = next.catch(() => {});
+    return next;
+}
+
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const naturalCollator = new Intl.Collator(undefined, {
     numeric: true,
@@ -22,7 +32,7 @@ const naturalCollator = new Intl.Collator(undefined, {
 function clearAllCaches() {
     catalogCache = null;
     scenesJsonCache.clear();
-    dirEnsurePromises.clear();
+    createdDirsCache.clear();
     existingWorldFilesCache.clear();
     uploadedAssetsCache.clear();
 }
@@ -83,25 +93,8 @@ Hooks.on("deleteScene", (scene) => {
 });
 
 /* -------------------------------------------- */
-/*  Funkcje pomocnicze i współbieżność          */
+/*  Funkcje pomocnicze i budowanie URL          */
 /* -------------------------------------------- */
-
-async function mapWithConcurrency(items, concurrency, iteratorFn) {
-    if (!Array.isArray(items) || items.length === 0) return [];
-    const results = new Array(items.length);
-    let nextIndex = 0;
-
-    const worker = async () => {
-        while (nextIndex < items.length) {
-            const current = nextIndex++;
-            results[current] = await iteratorFn(items[current], current);
-        }
-    };
-
-    const workersCount = Math.min(concurrency, items.length);
-    await Promise.all(Array.from({ length: workersCount }, () => worker()));
-    return results;
-}
 
 function openImagePreview(src, title) {
     if (!src) return;
@@ -281,54 +274,39 @@ async function loadPackScenesJson(baseUrl, moduleId) {
 /* -------------------------------------------- */
 
 async function ensureWorldDirectory(targetDir) {
-    if (dirEnsurePromises.has(targetDir)) {
-        return dirEnsurePromises.get(targetDir);
-    }
+    if (createdDirsCache.has(targetDir)) return;
 
-    const promise = (async () => {
-        const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+    const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
 
-        try {
-            const browsed = await FP.browse("data", targetDir);
-            if (browsed?.files) {
-                for (const f of browsed.files) {
-                    try {
-                        existingWorldFilesCache.add(decodeURIComponent(f));
-                    } catch {
-                        existingWorldFilesCache.add(f);
-                    }
+    // Sprawdź czy katalog już istnieje i zaindeksuj obecne w nim pliki
+    try {
+        const browsed = await FP.browse("data", targetDir);
+        if (browsed?.files) {
+            for (const f of browsed.files) {
+                try {
+                    existingWorldFilesCache.add(decodeURIComponent(f));
+                } catch {
+                    existingWorldFilesCache.add(f);
                 }
             }
-            return;
+        }
+        createdDirsCache.add(targetDir);
+        return;
+    } catch {
+        // Katalog jeszcze nie istnieje – utwórz drzewo katalogów
+    }
+
+    const parts = targetDir.split("/").filter(Boolean);
+    let current = parts.slice(0, 2).join("/");
+    for (let i = 2; i < parts.length; i++) {
+        current = `${current}/${parts[i]}`;
+        if (createdDirsCache.has(current)) continue;
+        try {
+            await FP.createDirectory("data", current);
         } catch {
-            // Katalog jeszcze nie istnieje – utwórz drzewo katalogów
+            // Folder już istnieje
         }
-
-        const parts = targetDir.split("/").filter(Boolean);
-        let current = parts.slice(0, 2).join("/");
-        for (let i = 2; i < parts.length; i++) {
-            current = `${current}/${parts[i]}`;
-            if (dirEnsurePromises.has(current) && current !== targetDir) {
-                await dirEnsurePromises.get(current);
-                continue;
-            }
-            try {
-                await FP.createDirectory("data", current);
-            } catch {
-                // Folder już istnieje
-            }
-            if (current !== targetDir) {
-                dirEnsurePromises.set(current, Promise.resolve());
-            }
-        }
-    })();
-
-    dirEnsurePromises.set(targetDir, promise);
-    try {
-        await promise;
-    } catch (err) {
-        dirEnsurePromises.delete(targetDir);
-        throw err;
+        createdDirsCache.add(current);
     }
 }
 
@@ -368,7 +346,11 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
         return uploadedAssetsCache.get(cacheKey);
     }
 
-    const taskPromise = (async () => {
+    return enqueueServerOp(async () => {
+        if (uploadedAssetsCache.has(cacheKey)) {
+            return uploadedAssetsCache.get(cacheKey);
+        }
+
         const cleanFileName = buildLocalAssetFilename(trimmed);
         const safeModuleDir = moduleId.replace(/[^a-zA-Z0-9-_]/g, "_");
         const targetDir = `worlds/${game.world.id}/zychu-maps/${safeModuleDir}/${subFolderHint}`;
@@ -377,6 +359,7 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
         await ensureWorldDirectory(targetDir);
 
         if (existingWorldFilesCache.has(expectedLocalPath)) {
+            uploadedAssetsCache.set(cacheKey, expectedLocalPath);
             return expectedLocalPath;
         }
 
@@ -393,16 +376,13 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
 
         const savedPath = uploadRes?.path || expectedLocalPath;
         existingWorldFilesCache.add(expectedLocalPath);
-        return savedPath;
-    })();
+        uploadedAssetsCache.set(cacheKey, savedPath);
 
-    uploadedAssetsCache.set(cacheKey, taskPromise);
-    try {
-        return await taskPromise;
-    } catch (err) {
-        uploadedAssetsCache.delete(cacheKey);
-        throw err;
-    }
+        // Krótka przerwa, aby proces Node.js serwera Foundry zwolnił bufory C++ przed kolejnym plikiem
+        await delay(40);
+
+        return savedPath;
+    });
 }
 
 /* -------------------------------------------- */
@@ -541,16 +521,20 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     raw.levels?.[0]?.background?.src ||
     null;
 
-    const rawThumbPath = meta?.thumb || raw.thumb || null;
+    let localBgPath = null;
+    if (rawBgPath) {
+        localBgPath = await downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps");
+    }
 
-    // Pobierz tło i miniaturę równolegle
-    const [localBgPath, downloadedThumbPath] = await Promise.all([
-        rawBgPath ? downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps") : Promise.resolve(null),
-                                                                 rawThumbPath
-                                                                 ? downloadAssetToWorld(baseUrl, rawThumbPath, pack.moduleId, "thumbs").catch(() => null)
-                                                                 : Promise.resolve(null)
-    ]);
-    const localThumbPath = downloadedThumbPath || localBgPath;
+    const rawThumbPath = meta?.thumb || raw.thumb || null;
+    let localThumbPath = localBgPath;
+    if (rawThumbPath) {
+        try {
+            localThumbPath = await downloadAssetToWorld(baseUrl, rawThumbPath, pack.moduleId, "thumbs");
+        } catch {
+            localThumbPath = localBgPath;
+        }
+    }
 
     const bgColor =
     (typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
@@ -582,7 +566,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
 
         if (Array.isArray(prepared.tiles)) {
-            await mapWithConcurrency(prepared.tiles, 4, async (tile) => {
+            for (const tile of prepared.tiles) {
                 tile._id = ensureValidId(tile._id);
                 const tileSrc = tile.texture?.src || tile.img;
                 if (tileSrc) {
@@ -596,11 +580,11 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
                     }
                 }
                 delete tile.img;
-            });
+            }
         }
 
         if (Array.isArray(prepared.tokens)) {
-            await mapWithConcurrency(prepared.tokens, 4, async (token) => {
+            for (const token of prepared.tokens) {
                 token._id = ensureValidId(token._id);
                 const tokSrc = token.texture?.src || token.img;
                 if (tokSrc) {
@@ -614,11 +598,11 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
                     }
                 }
                 delete token.img;
-            });
+            }
         }
 
         if (Array.isArray(prepared.sounds)) {
-            await mapWithConcurrency(prepared.sounds, 4, async (sound) => {
+            for (const sound of prepared.sounds) {
                 sound._id = ensureValidId(sound._id);
                 if (sound.path) {
                     try {
@@ -627,7 +611,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
                         sound.path = resolveAssetUrl(baseUrl, sound.path, pack.moduleId);
                     }
                 }
-            });
+            }
         }
 
         if (typeof prepared.foreground === "string" && prepared.foreground) {
@@ -784,26 +768,20 @@ async function importPackToWorld(pack, onProgress = null) {
     }
 
     const folder = await getOrCreateSceneFolder(pack);
+    const toCreate = [];
     let skippedCount = 0;
-    let completedCount = 0;
 
-    if (onProgress) onProgress(0, missingItems.length);
-
-    const preparedResults = await mapWithConcurrency(missingItems, 2, async ({ raw, meta }) => {
+    for (let i = 0; i < missingItems.length; i++) {
+        if (onProgress) onProgress(i + 1, missingItems.length);
+        const { raw, meta } = missingItems[i];
         try {
             const prepared = await prepareSceneDataWithLocalAssets(raw, pack, meta, folder.id, baseUrl);
-            return prepared;
+            toCreate.push(prepared);
         } catch (err) {
             skippedCount++;
             console.warn(`[${MODULE_ID}] Skipped broken scene "${meta?.name || raw.name}":`, err);
-            return null;
-        } finally {
-            completedCount++;
-            if (onProgress) onProgress(completedCount, missingItems.length);
         }
-    });
-
-    const toCreate = preparedResults.filter(Boolean);
+    }
 
     if (toCreate.length === 0) {
         throw new Error(game.i18n.format("ZMB.PackImportAllFailed", { title: packTitle }));
@@ -945,7 +923,6 @@ class ThumbnailQueue {
 
         img.onload = () => {
             img.classList.add("is-loaded");
-            img.parentElement?.classList.add("is-loaded");
             finish();
         };
         img.onerror = () => {
@@ -964,7 +941,6 @@ class ThumbnailQueue {
             img.onerror = null;
             img.src = FALLBACK_THUMB;
             img.classList.add("is-loaded");
-            img.parentElement?.classList.add("is-loaded");
             finish();
         };
         img.src = src;
