@@ -1,7 +1,7 @@
 {
   "ZMB.OpenBrowser": "Map Browser",
   "ZMB.ServerUrlName": "Map Server URL",
-  "ZMB.ServerUrlHint": "Full server address with catalog.json (e.g., https://maps.zychu.org). No trailing slash.",
+  "ZMB.ServerUrlHint": "Full server address with catalog.json (e.g., https://your.domain.org). No trailing slash.",
   "ZMB.WindowMainTitle": "Zychu's Map Browser",
   "ZMB.SearchPlaceholder": "Search by name...",
   "ZMB.StatusAll": "Status: All",

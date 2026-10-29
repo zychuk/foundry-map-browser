@@ -1,7 +1,7 @@
 {
   "ZMB.OpenBrowser": "Przeglądarka Map",
   "ZMB.ServerUrlName": "Adres URL serwera map",
-  "ZMB.ServerUrlHint": "Główny adres serwera z plikiem catalog.json (np. https://maps.zychu.org). Bez ukośnika na końcu.",
+  "ZMB.ServerUrlHint": "Główny adres serwera z plikiem catalog.json (np. https://twoja.domena.org). Bez ukośnika na końcu.",
   "ZMB.WindowMainTitle": "Zychu's Map Browser",
   "ZMB.SearchPlaceholder": "Szukaj po nazwie...",
   "ZMB.StatusAll": "Status: Wszystkie",
