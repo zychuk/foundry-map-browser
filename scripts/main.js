@@ -1,10 +1,13 @@
 const MODULE_ID = "zychu-map-browser";
 const ROOT_SCENE_FOLDER = "Zychu Maps";
+const FALLBACK_THUMB = "icons/svg/direction.svg";
 
 let catalogCache = null;
 let browserInstance = null;
 
-const createdDirsCache = new Set();
+const scenesJsonCache = new Map();
+const dirEnsurePromises = new Map();
+const existingWorldFilesCache = new Set();
 const uploadedAssetsCache = new Map();
 
 const naturalCollator = new Intl.Collator(undefined, {
@@ -16,9 +19,16 @@ const naturalCollator = new Intl.Collator(undefined, {
 /*  Inicjalizacja i ustawienia                  */
 /* -------------------------------------------- */
 
-function resetCachesOnUrlChange() {
+function clearAllCaches() {
     catalogCache = null;
+    scenesJsonCache.clear();
+    dirEnsurePromises.clear();
+    existingWorldFilesCache.clear();
     uploadedAssetsCache.clear();
+}
+
+function resetCachesOnUrlChange() {
+    clearAllCaches();
     if (browserInstance?.rendered) browserInstance.render();
 }
 
@@ -58,21 +68,51 @@ Hooks.on("renderSceneDirectory", (app, html) => {
     }
 });
 
-Hooks.on("createScene", () => {
+Hooks.on("createScene", (scene) => {
+    if (!scene?.getFlag?.(MODULE_ID, "moduleId")) return;
     if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
-        browserInstance.refreshGridOnly();
+        browserInstance.refreshGridOnly({ preserveScroll: true });
     }
 });
 
-Hooks.on("deleteScene", () => {
+Hooks.on("deleteScene", (scene) => {
+    if (!scene?.getFlag?.(MODULE_ID, "moduleId")) return;
     if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
-        browserInstance.refreshGridOnly();
+        browserInstance.refreshGridOnly({ preserveScroll: true });
     }
 });
 
 /* -------------------------------------------- */
-/*  Funkcje pomocnicze i budowanie URL          */
+/*  Funkcje pomocnicze i współbieżność          */
 /* -------------------------------------------- */
+
+async function mapWithConcurrency(items, concurrency, iteratorFn) {
+    if (!Array.isArray(items) || items.length === 0) return [];
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (nextIndex < items.length) {
+            const current = nextIndex++;
+            results[current] = await iteratorFn(items[current], current);
+        }
+    };
+
+    const workersCount = Math.min(concurrency, items.length);
+    await Promise.all(Array.from({ length: workersCount }, () => worker()));
+    return results;
+}
+
+function openImagePreview(src, title) {
+    if (!src) return;
+    const AppV2Popout = foundry.applications?.apps?.ImagePopout;
+    const AppV2Base = foundry.applications?.api?.ApplicationV2;
+    if (AppV2Popout && AppV2Base && AppV2Popout.prototype instanceof AppV2Base) {
+        new AppV2Popout({ src, window: { title } }).render({ force: true });
+    } else if (typeof ImagePopout !== "undefined") {
+        new ImagePopout(src, { title }).render(true);
+    }
+}
 
 function getServerUrl() {
     const raw = game.settings.get(MODULE_ID, "serverUrl") || "";
@@ -80,12 +120,14 @@ function getServerUrl() {
 }
 
 function getCleanPackTitle(pack) {
+    if (pack._cleanTitle) return pack._cleanTitle;
     return (pack.title || pack.moduleId || "")
     .replace(/^(Cze and Peku\s*-\s*|Czepeku Scenes\s*-\s*|Czepeku\s*-\s*)/i, "")
     .trim();
 }
 
 function getSortKey(pack) {
+    if (pack._sortKey) return pack._sortKey;
     return getCleanPackTitle(pack)
     .replace(/^\d+\s*[-–.]*\s*/, "")
     .trim();
@@ -153,7 +195,7 @@ function getPackCoverCandidates(baseUrl, pack) {
     const seen = new Set();
 
     const addCandidate = (relPath) => {
-        if (!relPath) return;
+        if (!relPath || candidates.length >= 5) return;
         const url = resolveAssetUrl(baseUrl, relPath, pack.moduleId);
         if (url && !seen.has(url)) {
             seen.add(url);
@@ -166,10 +208,8 @@ function getPackCoverCandidates(baseUrl, pack) {
     }
 
     if (Array.isArray(pack.scenes)) {
-        for (const s of pack.scenes) {
-            addCandidate(s.thumb);
-            addCandidate(s.bg);
-        }
+        for (const s of pack.scenes) addCandidate(s.thumb);
+        for (const s of pack.scenes) addCandidate(s.bg);
     }
 
     return candidates;
@@ -188,18 +228,52 @@ function getSceneThumbCandidates(baseUrl, pack, sceneMeta) {
     return candidates;
 }
 
+function preprocessCatalog(catalog) {
+    if (!catalog || !Array.isArray(catalog.packs)) return catalog;
+    for (const pack of catalog.packs) {
+        pack._cleanTitle = getCleanPackTitle(pack);
+        pack._sortKey = getSortKey(pack);
+        const sceneNames = Array.isArray(pack.scenes)
+        ? pack.scenes.map(s => s.name || "").join(" ")
+        : "";
+        pack._searchBlob = `${pack._cleanTitle} ${pack.title || ""} ${pack.moduleId || ""} ${sceneNames}`.toLowerCase();
+    }
+    catalog.packs.sort((a, b) => {
+        const cmp = naturalCollator.compare(a._sortKey, b._sortKey);
+        if (cmp !== 0) return cmp;
+        return naturalCollator.compare(a._cleanTitle, b._cleanTitle);
+    });
+    return catalog;
+}
+
 async function loadCatalog(force = false) {
     const baseUrl = getServerUrl();
     if (!baseUrl) return null;
 
     if (!catalogCache || force) {
+        if (force) scenesJsonCache.clear();
         const response = await fetch(`${baseUrl}/catalog.json`, { cache: "no-cache" });
         if (!response.ok) {
             throw new Error(game.i18n.format("ZMB.CatalogError", { status: response.status }));
         }
-        catalogCache = await response.json();
+        const rawCatalog = await response.json();
+        catalogCache = preprocessCatalog(rawCatalog);
     }
     return catalogCache;
+}
+
+async function loadPackScenesJson(baseUrl, moduleId) {
+    if (scenesJsonCache.has(moduleId)) {
+        return scenesJsonCache.get(moduleId);
+    }
+    const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(moduleId)}/scenes.json`;
+    const res = await fetch(scenesUrl);
+    if (!res.ok) {
+        throw new Error(game.i18n.format("ZMB.CatalogError", { status: res.status }));
+    }
+    const rawScenes = await res.json();
+    scenesJsonCache.set(moduleId, rawScenes);
+    return rawScenes;
 }
 
 /* -------------------------------------------- */
@@ -207,22 +281,76 @@ async function loadCatalog(force = false) {
 /* -------------------------------------------- */
 
 async function ensureWorldDirectory(targetDir) {
-    if (createdDirsCache.has(targetDir)) return;
-
-    const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
-    const parts = targetDir.split("/").filter(Boolean);
-
-    let current = parts.slice(0, 2).join("/");
-    for (let i = 2; i < parts.length; i++) {
-        current = `${current}/${parts[i]}`;
-        if (createdDirsCache.has(current)) continue;
-        try {
-            await FP.createDirectory("data", current);
-        } catch {
-            // Folder już istnieje
-        }
-        createdDirsCache.add(current);
+    if (dirEnsurePromises.has(targetDir)) {
+        return dirEnsurePromises.get(targetDir);
     }
+
+    const promise = (async () => {
+        const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+
+        try {
+            const browsed = await FP.browse("data", targetDir);
+            if (browsed?.files) {
+                for (const f of browsed.files) {
+                    try {
+                        existingWorldFilesCache.add(decodeURIComponent(f));
+                    } catch {
+                        existingWorldFilesCache.add(f);
+                    }
+                }
+            }
+            return;
+        } catch {
+            // Katalog jeszcze nie istnieje – utwórz drzewo katalogów
+        }
+
+        const parts = targetDir.split("/").filter(Boolean);
+        let current = parts.slice(0, 2).join("/");
+        for (let i = 2; i < parts.length; i++) {
+            current = `${current}/${parts[i]}`;
+            if (dirEnsurePromises.has(current) && current !== targetDir) {
+                await dirEnsurePromises.get(current);
+                continue;
+            }
+            try {
+                await FP.createDirectory("data", current);
+            } catch {
+                // Folder już istnieje
+            }
+            if (current !== targetDir) {
+                dirEnsurePromises.set(current, Promise.resolve());
+            }
+        }
+    })();
+
+    dirEnsurePromises.set(targetDir, promise);
+    try {
+        await promise;
+    } catch (err) {
+        dirEnsurePromises.delete(targetDir);
+        throw err;
+    }
+}
+
+function buildLocalAssetFilename(trimmedPath) {
+    let relInsideModule = trimmedPath.replace(/^\/+/, "");
+    if (relInsideModule.startsWith("modules/")) {
+        relInsideModule = relInsideModule.split("/").slice(2).join("/");
+    }
+    const relParts = relInsideModule.split("/").filter(Boolean).map(seg => {
+        try {
+            return decodeURIComponent(seg);
+        } catch {
+            return seg;
+        }
+    });
+
+    if (relParts.length > 1 && ["maps", "_thumbs", "thumbs", "tiles", "tokens", "audio", "sounds"].includes(relParts[0].toLowerCase())) {
+        relParts.shift();
+    }
+
+    const rawFileName = relParts.join("_") || "asset.webp";
+    return rawFileName.replace(/\s+/g, "_");
 }
 
 async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint = "maps") {
@@ -235,39 +363,46 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
     const remoteUrl = resolveAssetUrl(baseUrl, trimmed, moduleId);
     if (!remoteUrl) return "";
 
-    const cacheKey = `${game.world.id}:${remoteUrl}`;
+    const cacheKey = `${game.world.id}:${subFolderHint}:${remoteUrl}`;
     if (uploadedAssetsCache.has(cacheKey)) {
         return uploadedAssetsCache.get(cacheKey);
     }
 
-    const rawFileName = trimmed.split("/").pop() || "asset.webp";
-    let decodedFileName = rawFileName;
+    const taskPromise = (async () => {
+        const cleanFileName = buildLocalAssetFilename(trimmed);
+        const safeModuleDir = moduleId.replace(/[^a-zA-Z0-9-_]/g, "_");
+        const targetDir = `worlds/${game.world.id}/zychu-maps/${safeModuleDir}/${subFolderHint}`;
+        const expectedLocalPath = `${targetDir}/${cleanFileName}`;
+
+        await ensureWorldDirectory(targetDir);
+
+        if (existingWorldFilesCache.has(expectedLocalPath)) {
+            return expectedLocalPath;
+        }
+
+        const response = await fetch(remoteUrl);
+        if (!response.ok) {
+            throw new Error(game.i18n.format("ZMB.DownloadAssetError", { status: response.status, url: remoteUrl }));
+        }
+
+        const blob = await response.blob();
+        const file = new File([blob], cleanFileName, { type: blob.type || "application/octet-stream" });
+
+        const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
+        const uploadRes = await FP.upload("data", targetDir, file, {}, { notify: false });
+
+        const savedPath = uploadRes?.path || expectedLocalPath;
+        existingWorldFilesCache.add(expectedLocalPath);
+        return savedPath;
+    })();
+
+    uploadedAssetsCache.set(cacheKey, taskPromise);
     try {
-        decodedFileName = decodeURIComponent(rawFileName);
-    } catch {
-        // Zostaw oryginał
+        return await taskPromise;
+    } catch (err) {
+        uploadedAssetsCache.delete(cacheKey);
+        throw err;
     }
-
-    const cleanFileName = decodedFileName.replace(/\s+/g, "_");
-    const safeModuleDir = moduleId.replace(/[^a-zA-Z0-9-_]/g, "_");
-    const targetDir = `worlds/${game.world.id}/zychu-maps/${safeModuleDir}/${subFolderHint}`;
-
-    await ensureWorldDirectory(targetDir);
-
-    const response = await fetch(remoteUrl);
-    if (!response.ok) {
-        throw new Error(`Nie udało się pobrać pliku (${response.status}): ${remoteUrl}`);
-    }
-
-    const blob = await response.blob();
-    const file = new File([blob], cleanFileName, { type: blob.type || "application/octet-stream" });
-
-    const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
-    const uploadRes = await FP.upload("data", targetDir, file, {}, { notify: false });
-
-    const savedPath = uploadRes?.path || `${targetDir}/${cleanFileName}`;
-    uploadedAssetsCache.set(cacheKey, savedPath);
-    return savedPath;
 }
 
 /* -------------------------------------------- */
@@ -369,6 +504,8 @@ function normalizeLegacyWalls(walls) {
         if (val === 0) return 0;
         if (val === 1) return 20;
         if (val === 2) return 10;
+        if (val === 3) return 30;
+        if (val === 4) return 40;
         if ([0, 10, 20, 30, 40].includes(val)) return val;
         return 20;
     };
@@ -393,7 +530,7 @@ function normalizeLegacyWalls(walls) {
 }
 
 async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUrl) {
-    const originalId = raw._id;
+    const originalId = raw._id || meta?.id;
     const prepared = foundry.utils.deepClone(raw);
     delete prepared._id;
 
@@ -401,151 +538,196 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     meta?.bg ||
     raw.background?.src ||
     raw.img ||
+    raw.levels?.[0]?.background?.src ||
     null;
 
-    let localBgPath = null;
-    if (rawBgPath) {
-        localBgPath = await downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps");
-    }
-
     const rawThumbPath = meta?.thumb || raw.thumb || null;
-    let localThumbPath = localBgPath;
-    if (rawThumbPath) {
-        try {
-            localThumbPath = await downloadAssetToWorld(baseUrl, rawThumbPath, pack.moduleId, "thumbs");
-        } catch {
-            localThumbPath = localBgPath;
-        }
-    }
+
+    // Pobierz tło i miniaturę równolegle
+    const [localBgPath, downloadedThumbPath] = await Promise.all([
+        rawBgPath ? downloadAssetToWorld(baseUrl, rawBgPath, pack.moduleId, "maps") : Promise.resolve(null),
+                                                                 rawThumbPath
+                                                                 ? downloadAssetToWorld(baseUrl, rawThumbPath, pack.moduleId, "thumbs").catch(() => null)
+                                                                 : Promise.resolve(null)
+    ]);
+    const localThumbPath = downloadedThumbPath || localBgPath;
 
     const bgColor =
     (typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
     (typeof raw.bgColor === "string" && raw.bgColor) ||
     "#000000";
 
-    if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
-    if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
+        if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
+        if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
-    if (typeof prepared.grid === "number" || !prepared.grid) {
-        const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
-        prepared.grid = {
-            size: gridSize || 100,
-            type: prepared.gridType ?? 1,
-            distance: prepared.gridDistance ?? 5,
-            units: prepared.gridUnits || "ft",
-            color: prepared.gridColor || "#000000",
-            alpha: prepared.gridAlpha ?? 0.2
-        };
-        delete prepared.gridType;
-        delete prepared.gridDistance;
-        delete prepared.gridUnits;
-        delete prepared.gridColor;
-        delete prepared.gridAlpha;
-    }
+        if (typeof prepared.grid === "number" || !prepared.grid) {
+            const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
+            prepared.grid = {
+                size: gridSize || 100,
+                type: prepared.gridType ?? 1,
+                distance: prepared.gridDistance ?? 5,
+                units: prepared.gridUnits || "ft",
+                color: prepared.gridColor || "#000000",
+                alpha: prepared.gridAlpha ?? 0.2
+            };
+            delete prepared.gridType;
+            delete prepared.gridDistance;
+            delete prepared.gridUnits;
+            delete prepared.gridColor;
+            delete prepared.gridAlpha;
+        }
 
-    if (Array.isArray(prepared.walls)) {
-        prepared.walls = normalizeLegacyWalls(prepared.walls);
-    }
+        if (Array.isArray(prepared.walls)) {
+            prepared.walls = normalizeLegacyWalls(prepared.walls);
+        }
 
-    if (Array.isArray(prepared.tiles)) {
-        for (const tile of prepared.tiles) {
-            tile._id = ensureValidId(tile._id);
-            const tileSrc = tile.texture?.src || tile.img;
-            if (tileSrc) {
-                try {
-                    const localTilePath = await downloadAssetToWorld(baseUrl, tileSrc, pack.moduleId, "tiles");
-                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: localTilePath });
-                } catch {
-                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
-                        src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
-                    });
+        if (Array.isArray(prepared.tiles)) {
+            await mapWithConcurrency(prepared.tiles, 4, async (tile) => {
+                tile._id = ensureValidId(tile._id);
+                const tileSrc = tile.texture?.src || tile.img;
+                if (tileSrc) {
+                    try {
+                        const localTilePath = await downloadAssetToWorld(baseUrl, tileSrc, pack.moduleId, "tiles");
+                        tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: localTilePath });
+                    } catch {
+                        tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
+                            src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
+                        });
+                    }
+                }
+                delete tile.img;
+            });
+        }
+
+        if (Array.isArray(prepared.tokens)) {
+            await mapWithConcurrency(prepared.tokens, 4, async (token) => {
+                token._id = ensureValidId(token._id);
+                const tokSrc = token.texture?.src || token.img;
+                if (tokSrc) {
+                    try {
+                        const localTokPath = await downloadAssetToWorld(baseUrl, tokSrc, pack.moduleId, "tokens");
+                        token.texture = foundry.utils.mergeObject(token.texture || {}, { src: localTokPath });
+                    } catch {
+                        token.texture = foundry.utils.mergeObject(token.texture || {}, {
+                            src: resolveAssetUrl(baseUrl, tokSrc, pack.moduleId)
+                        });
+                    }
+                }
+                delete token.img;
+            });
+        }
+
+        if (Array.isArray(prepared.sounds)) {
+            await mapWithConcurrency(prepared.sounds, 4, async (sound) => {
+                sound._id = ensureValidId(sound._id);
+                if (sound.path) {
+                    try {
+                        sound.path = await downloadAssetToWorld(baseUrl, sound.path, pack.moduleId, "audio");
+                    } catch {
+                        sound.path = resolveAssetUrl(baseUrl, sound.path, pack.moduleId);
+                    }
+                }
+            });
+        }
+
+        if (typeof prepared.foreground === "string" && prepared.foreground) {
+            try {
+                prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
+            } catch {
+                delete prepared.foreground;
+            }
+        }
+
+        for (const key of ["lights", "templates", "notes", "drawings"]) {
+            if (Array.isArray(prepared[key])) {
+                for (const item of prepared[key]) {
+                    item._id = ensureValidId(item._id);
                 }
             }
-            delete tile.img;
         }
-    }
 
-    if (typeof prepared.foreground === "string" && prepared.foreground) {
-        try {
-            prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
-        } catch {
-            delete prepared.foreground;
-        }
-    }
-
-    for (const key of ["lights", "sounds", "templates", "tokens", "notes", "drawings"]) {
-        if (Array.isArray(prepared[key])) {
-            for (const item of prepared[key]) {
-                item._id = ensureValidId(item._id);
-            }
-        }
-    }
-
-    delete prepared.img;
-    delete prepared.bgColor;
-    prepared.backgroundColor = bgColor;
-    prepared.background = foundry.utils.mergeObject(
-        typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-        { src: localBgPath }
-    );
-
-    try {
-        if (typeof Scene.migrateData === "function") {
-            const migrated = Scene.migrateData(prepared);
-            Object.assign(prepared, migrated);
-        }
-    } catch (err) {
-        console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
-    }
-
-    if (localBgPath) {
+        delete prepared.img;
+        delete prepared.bgColor;
+        prepared.backgroundColor = bgColor;
         prepared.background = foundry.utils.mergeObject(
             typeof prepared.background === "object" && prepared.background ? prepared.background : {},
             { src: localBgPath }
         );
 
-        if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
-            for (const lvl of prepared.levels) {
-                lvl._id = ensureValidId(lvl._id);
-                if (!lvl.name) lvl.name = "Initial Level";
-                lvl.background = foundry.utils.mergeObject(
-                    typeof lvl.background === "object" && lvl.background ? lvl.background : {},
-                    { src: localBgPath, color: bgColor }
-                );
+        try {
+            if (typeof Scene.migrateData === "function") {
+                const migrated = Scene.migrateData(prepared);
+                Object.assign(prepared, migrated);
             }
-        } else if (Scene.schema?.fields?.levels) {
-            const levelId = foundry.utils.randomID();
-            prepared.levels = [
-                {
-                    _id: levelId,
-                    name: "Initial Level",
-                    background: {
-                        src: localBgPath,
-                        color: bgColor
+        } catch (err) {
+            console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
+        }
+
+        if (localBgPath) {
+            prepared.background = foundry.utils.mergeObject(
+                typeof prepared.background === "object" && prepared.background ? prepared.background : {},
+                { src: localBgPath }
+            );
+
+            if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
+                for (let i = 0; i < prepared.levels.length; i++) {
+                    const lvl = prepared.levels[i];
+                    const oldId = lvl._id;
+                    lvl._id = ensureValidId(lvl._id);
+                    if (prepared.initialLevel === oldId) prepared.initialLevel = lvl._id;
+                    if (!lvl.name) lvl.name = i === 0 ? "Initial Level" : `Level ${i + 1}`;
+
+                    let lvlBg = localBgPath;
+                    if (lvl.background?.src && lvl.background.src !== rawBgPath && !lvl.background.src.startsWith("worlds/")) {
+                        try {
+                            lvlBg = await downloadAssetToWorld(baseUrl, lvl.background.src, pack.moduleId, "maps");
+                        } catch {
+                            lvlBg = localBgPath;
+                        }
+                    } else if (lvl.background?.src?.startsWith("worlds/")) {
+                        lvlBg = lvl.background.src;
+                    }
+
+                    if (i === 0 || lvl.background?.src) {
+                        lvl.background = foundry.utils.mergeObject(
+                            typeof lvl.background === "object" && lvl.background ? lvl.background : {},
+                            { src: lvlBg, color: bgColor }
+                        );
                     }
                 }
-            ];
-            if ("initialLevel" in Scene.schema.fields) {
-                prepared.initialLevel = levelId;
+            } else if (Scene.schema?.fields?.levels) {
+                const levelId = foundry.utils.randomID();
+                prepared.levels = [
+                    {
+                        _id: levelId,
+                        name: "Initial Level",
+                        background: {
+                            src: localBgPath,
+                            color: bgColor
+                        }
+                    }
+                ];
+                if ("initialLevel" in Scene.schema.fields) {
+                    prepared.initialLevel = levelId;
+                }
             }
         }
-    }
 
-    prepared.folder = folderId;
-    if (localThumbPath) {
-        prepared.thumb = localThumbPath;
-    }
-
-    prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
-        [MODULE_ID]: {
-            moduleId: pack.moduleId,
-            sceneId: originalId,
-            version: pack.version || "1.0.0",
-            bgPath: localBgPath
+        prepared.folder = folderId;
+        if (localThumbPath) {
+            prepared.thumb = localThumbPath;
         }
-    });
 
-    return prepared;
+        prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
+            [MODULE_ID]: {
+                moduleId: pack.moduleId,
+                sceneId: originalId,
+                version: pack.version || "1.0.0",
+                bgPath: localBgPath
+            }
+        });
+
+        return prepared;
 }
 
 async function ensureCreatedScenesHaveLevelBg(createdDocs) {
@@ -559,7 +741,7 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
             try {
                 await firstLevel.update({ "background.src": expectedBg });
             } catch (err) {
-                console.warn(`[${MODULE_ID}] Nie udało się zaktualizować tła poziomu:`, err);
+                console.warn(`[${MODULE_ID}] Failed to update level background:`, err);
             }
         }
     }
@@ -571,12 +753,7 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
 
 async function importPackToWorld(pack, onProgress = null) {
     const baseUrl = getServerUrl();
-    const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
-
-    const res = await fetch(scenesUrl);
-    if (!res.ok) throw new Error(game.i18n.format("ZMB.CatalogError", { status: res.status }));
-
-    const rawScenes = await res.json();
+    const rawScenes = await loadPackScenesJson(baseUrl, pack.moduleId);
     const worldIndex = buildWorldSceneIndex();
     const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
 
@@ -585,12 +762,18 @@ async function importPackToWorld(pack, onProgress = null) {
         const raw = rawScenes[i];
         const meta =
         packScenes.find(s => s.id === raw._id) ||
-        packScenes.find(s => s.name === raw.name);
-
-        if (!meta) continue;
+        packScenes.find(s => s.name === raw.name) ||
+        {
+            id: raw._id,
+            name: raw.name,
+            width: raw.width,
+            height: raw.height,
+            thumb: raw.thumb,
+            bg: raw.background?.src || raw.img
+        };
 
         const sceneId = meta.id || raw._id;
-        if (findWorldScene(worldIndex, pack.moduleId, sceneId)) continue;
+        if (!sceneId || findWorldScene(worldIndex, pack.moduleId, sceneId)) continue;
         missingItems.push({ raw, meta });
     }
 
@@ -601,23 +784,29 @@ async function importPackToWorld(pack, onProgress = null) {
     }
 
     const folder = await getOrCreateSceneFolder(pack);
-    const toCreate = [];
     let skippedCount = 0;
+    let completedCount = 0;
 
-    for (let i = 0; i < missingItems.length; i++) {
-        if (onProgress) onProgress(i + 1, missingItems.length);
-        const { raw, meta } = missingItems[i];
+    if (onProgress) onProgress(0, missingItems.length);
+
+    const preparedResults = await mapWithConcurrency(missingItems, 2, async ({ raw, meta }) => {
         try {
             const prepared = await prepareSceneDataWithLocalAssets(raw, pack, meta, folder.id, baseUrl);
-            toCreate.push(prepared);
+            return prepared;
         } catch (err) {
             skippedCount++;
-            console.warn(`[${MODULE_ID}] Pominięto uszkodzoną scenę "${meta?.name || raw.name}":`, err);
+            console.warn(`[${MODULE_ID}] Skipped broken scene "${meta?.name || raw.name}":`, err);
+            return null;
+        } finally {
+            completedCount++;
+            if (onProgress) onProgress(completedCount, missingItems.length);
         }
-    }
+    });
+
+    const toCreate = preparedResults.filter(Boolean);
 
     if (toCreate.length === 0) {
-        throw new Error(`Nie udało się pobrać żadnej sceny z paczki "${packTitle}".`);
+        throw new Error(game.i18n.format("ZMB.PackImportAllFailed", { title: packTitle }));
     }
 
     if (browserInstance) browserInstance.isBulkImporting = true;
@@ -643,26 +832,27 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
     if (existing) return existing;
 
     const baseUrl = getServerUrl();
-    const scenesUrl = `${baseUrl}/modules/${encodeURIComponent(pack.moduleId)}/scenes.json`;
-
-    const res = await fetch(scenesUrl);
-    if (!res.ok) throw new Error(game.i18n.format("ZMB.CatalogError", { status: res.status }));
-
-    const rawScenes = await res.json();
+    const rawScenes = await loadPackScenesJson(baseUrl, pack.moduleId);
     const raw =
     rawScenes.find(s => s._id === sceneMeta.id) ||
     rawScenes.find(s => s.name === sceneMeta.name);
-    if (!raw) throw new Error("Nie znaleziono wybranej sceny w pliku scenes.json.");
+    if (!raw) throw new Error(game.i18n.localize("ZMB.SceneNotFoundInJson"));
 
     const folder = await getOrCreateSceneFolder(pack);
     const prepared = await prepareSceneDataWithLocalAssets(raw, pack, sceneMeta, folder.id, baseUrl);
 
-    const created = await Scene.create(prepared);
-    if (!created) {
-        throw new Error(`Nie udało się utworzyć sceny "${sceneMeta.name}".`);
+    if (browserInstance) browserInstance.isBulkImporting = true;
+    let created = null;
+    try {
+        created = await Scene.create(prepared);
+        if (!created) {
+            throw new Error(game.i18n.format("ZMB.SceneCreateError", { name: sceneMeta.name }));
+        }
+        await ensureCreatedScenesHaveLevelBg([created]);
+    } finally {
+        if (browserInstance) browserInstance.isBulkImporting = false;
     }
 
-    await ensureCreatedScenesHaveLevelBg([created]);
     ui.notifications.info(game.i18n.format("ZMB.SceneImportedInfo", { name: created.name }));
     return created;
 }
@@ -672,7 +862,7 @@ async function importSingleSceneToWorld(pack, sceneMeta) {
 /* -------------------------------------------- */
 
 class ThumbnailQueue {
-    constructor(concurrency = 3) {
+    constructor(concurrency = 4) {
         this.concurrency = concurrency;
         this.active = 0;
         this.queue = [];
@@ -686,6 +876,8 @@ class ThumbnailQueue {
         if (this.observer) {
             this.observer.disconnect();
         }
+
+        if (!scrollRoot) return;
 
         const currentGen = this.generation;
         this.observer = new IntersectionObserver(
@@ -709,19 +901,20 @@ class ThumbnailQueue {
     observe(imgElement) {
         if (this.observer) {
             this.observer.observe(imgElement);
+        } else {
+            this.enqueue(imgElement, false);
         }
-        this.enqueue(imgElement, false);
     }
 
     enqueue(img, highPriority = false) {
         if (!img || (img.dataset.queued === "true" && !highPriority)) return;
+        img.dataset.queued = "true";
 
         if (highPriority) {
             const idx = this.queue.indexOf(img);
             if (idx !== -1) this.queue.splice(idx, 1);
             this.queue.unshift(img);
         } else {
-            img.dataset.queued = "true";
             this.queue.push(img);
         }
 
@@ -752,6 +945,7 @@ class ThumbnailQueue {
 
         img.onload = () => {
             img.classList.add("is-loaded");
+            img.parentElement?.classList.add("is-loaded");
             finish();
         };
         img.onerror = () => {
@@ -768,8 +962,9 @@ class ThumbnailQueue {
 
             img.onload = null;
             img.onerror = null;
-            img.src = "icons/svg/adastra.svg";
+            img.src = FALLBACK_THUMB;
             img.classList.add("is-loaded");
+            img.parentElement?.classList.add("is-loaded");
             finish();
         };
         img.src = src;
@@ -788,10 +983,14 @@ class HomelabMapBrowser extends BaseApp {
         this.filterStatus = "all";
         this.filterCategory = "all";
         this.searchQuery = "";
+        this.savedPackSearch = "";
+        this.savedPackScrollTop = 0;
         this.selectedPack = null;
         this.gridContainer = null;
         this.countElement = null;
-        this.thumbQueue = new ThumbnailQueue(3);
+        this.searchInput = null;
+        this.packImportHeaderBtn = null;
+        this.thumbQueue = new ThumbnailQueue(4);
         this.searchTimeout = null;
         this.isBulkImporting = false;
     }
@@ -801,7 +1000,7 @@ class HomelabMapBrowser extends BaseApp {
         tag: "div",
         classes: ["zychu-map-browser"],
         window: {
-            title: "Zychu.WindowMainTitle",
+            title: "ZMB.WindowMainTitle",
             icon: "fa-solid fa-map",
             resizable: true
         },
@@ -814,6 +1013,29 @@ class HomelabMapBrowser extends BaseApp {
     /** @override */
     get title() {
         return game.i18n.localize("ZMB.WindowMainTitle");
+    }
+
+    /** @override */
+    _onClose(options) {
+        super._onClose?.(options);
+        clearTimeout(this.searchTimeout);
+        this.thumbQueue.reset(null);
+    }
+
+    _openPack(pack) {
+        this.savedPackSearch = this.searchQuery;
+        this.savedPackScrollTop = this.gridContainer?.scrollTop || 0;
+        this.searchQuery = "";
+        if (this.searchInput) this.searchInput.value = "";
+        this.selectedPack = pack;
+        this.refreshGridOnly({ scrollTop: 0 });
+    }
+
+    _goBackToPacks() {
+        this.selectedPack = null;
+        this.searchQuery = this.savedPackSearch || "";
+        if (this.searchInput) this.searchInput.value = this.searchQuery;
+        this.refreshGridOnly({ scrollTop: this.savedPackScrollTop });
     }
 
     async _renderHTML() {
@@ -832,7 +1054,7 @@ class HomelabMapBrowser extends BaseApp {
             </div>
             `;
             wrapper.querySelector(".zmb-open-settings")?.addEventListener("click", () => {
-                new SettingsConfig().render(true);
+                game.settings.sheet.render(true);
             });
             return wrapper;
         }
@@ -842,8 +1064,8 @@ class HomelabMapBrowser extends BaseApp {
         } catch (err) {
             wrapper.innerHTML = `
             <div class="zmb-empty">
-            <p><strong>${game.i18n.localize("ZMB.ConnectionError")}</strong> ${baseUrl}</p>
-            <p>${err.message}</p>
+            <p><strong>${game.i18n.localize("ZMB.ConnectionError")}</strong> ${foundry.utils.escapeHTML(baseUrl)}</p>
+            <p>${foundry.utils.escapeHTML(err.message)}</p>
             <button type="button" class="zmb-retry">
             <i class="fa-solid fa-rotate"></i> ${game.i18n.localize("ZMB.Retry")}
             </button>
@@ -853,23 +1075,25 @@ class HomelabMapBrowser extends BaseApp {
             return wrapper;
         }
 
+        const safeSearch = foundry.utils.escapeHTML(this.searchQuery);
         wrapper.innerHTML = `
         <div class="zmb-toolbar">
         <button type="button" class="zmb-back-btn" style="display:none;">
         <i class="fa-solid fa-arrow-left"></i> ${game.i18n.localize("ZMB.Back")}
         </button>
-        <input type="search" class="zmb-search" placeholder="${game.i18n.localize("ZMB.SearchPlaceholder")}" value="${this.searchQuery}" />
-        <select class="zmb-status-filter" title="">
+        <input type="search" class="zmb-search" placeholder="${foundry.utils.escapeHTML(game.i18n.localize("ZMB.SearchPlaceholder"))}" value="${safeSearch}" />
+        <select class="zmb-status-filter">
         <option value="all" ${this.filterStatus === "all" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusAll")}</option>
         <option value="imported" ${this.filterStatus === "imported" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusImported")}</option>
         <option value="not-imported" ${this.filterStatus === "not-imported" ? "selected" : ""}>${game.i18n.localize("ZMB.StatusNotImported")}</option>
         </select>
-        <select class="zmb-cat-filter" title="">
+        <select class="zmb-cat-filter">
         <option value="all" ${this.filterCategory === "all" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeAll")}</option>
         <option value="map" ${this.filterCategory === "map" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeBattlemaps")}</option>
         <option value="scene" ${this.filterCategory === "scene" ? "selected" : ""}>${game.i18n.localize("ZMB.TypeScenes")}</option>
         </select>
-        <button type="button" class="zmb-refresh-btn" title="${game.i18n.localize("ZMB.RefreshCatalog")}">
+        <button type="button" class="zmb-pack-import-header-btn" style="display:none;"></button>
+        <button type="button" class="zmb-refresh-btn" title="${foundry.utils.escapeHTML(game.i18n.localize("ZMB.RefreshCatalog"))}">
         <i class="fa-solid fa-rotate"></i>
         </button>
         <span class="zmb-count"></span>
@@ -877,12 +1101,14 @@ class HomelabMapBrowser extends BaseApp {
         <div class="zmb-grid"></div>
         `;
 
-        this._bindToolbarEvents(wrapper);
         this.gridContainer = wrapper.querySelector(".zmb-grid");
         this.countElement = wrapper.querySelector(".zmb-count");
         this.backButton = wrapper.querySelector(".zmb-back-btn");
         this.catSelect = wrapper.querySelector(".zmb-cat-filter");
+        this.searchInput = wrapper.querySelector(".zmb-search");
+        this.packImportHeaderBtn = wrapper.querySelector(".zmb-pack-import-header-btn");
 
+        this._bindToolbarEvents(wrapper);
         this.refreshGridOnly();
         return wrapper;
     }
@@ -892,34 +1118,64 @@ class HomelabMapBrowser extends BaseApp {
     }
 
     _bindToolbarEvents(wrapper) {
-        const searchInput = wrapper.querySelector(".zmb-search");
         const statusSelect = wrapper.querySelector(".zmb-status-filter");
         const catSelect = wrapper.querySelector(".zmb-cat-filter");
         const refreshBtn = wrapper.querySelector(".zmb-refresh-btn");
         const backBtn = wrapper.querySelector(".zmb-back-btn");
 
-        searchInput.addEventListener("input", (ev) => {
+        wrapper.addEventListener("keydown", (ev) => {
+            if (ev.key === "Escape" && this.selectedPack && !this.isBulkImporting) {
+                if (document.activeElement === this.searchInput && this.searchQuery) {
+                    return;
+                }
+                ev.preventDefault();
+                ev.stopPropagation();
+                this._goBackToPacks();
+            }
+        });
+
+        this.searchInput.addEventListener("input", (ev) => {
             clearTimeout(this.searchTimeout);
             this.searchTimeout = setTimeout(() => {
                 this.searchQuery = ev.target.value.trim().toLowerCase();
-                this.refreshGridOnly();
-            }, 120);
+                this.refreshGridOnly({ scrollTop: 0 });
+            }, 100);
         });
 
         statusSelect.addEventListener("change", (ev) => {
             this.filterStatus = ev.target.value;
-            this.refreshGridOnly();
+            this.refreshGridOnly({ scrollTop: 0 });
         });
 
         catSelect.addEventListener("change", (ev) => {
             this.filterCategory = ev.target.value;
-            this.refreshGridOnly();
+            this.refreshGridOnly({ scrollTop: 0 });
+        });
+
+        this.packImportHeaderBtn.addEventListener("click", async (ev) => {
+            if (!this.selectedPack) return;
+            const pack = this.selectedPack;
+            const btn = ev.currentTarget;
+            btn.disabled = true;
+            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+            try {
+                await importPackToWorld(pack, (current, total) => {
+                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`;
+                });
+                this.refreshGridOnly({ preserveScroll: true });
+            } catch (err) {
+                ui.notifications.error(err.message);
+                this.refreshGridOnly({ preserveScroll: true });
+            }
         });
 
         refreshBtn.addEventListener("click", async () => {
             try {
                 await loadCatalog(true);
-                this.refreshGridOnly();
+                if (this.selectedPack) {
+                    this.selectedPack = (catalogCache?.packs || []).find(p => p.moduleId === this.selectedPack.moduleId) || null;
+                }
+                this.refreshGridOnly({ preserveScroll: true });
                 ui.notifications.info(game.i18n.localize("ZMB.CatalogRefreshed"));
             } catch (err) {
                 ui.notifications.error(err.message);
@@ -927,19 +1183,25 @@ class HomelabMapBrowser extends BaseApp {
         });
 
         backBtn.addEventListener("click", () => {
-            this.selectedPack = null;
-            this.refreshGridOnly();
+            this._goBackToPacks();
         });
     }
 
-    refreshGridOnly() {
+    refreshGridOnly(options = {}) {
         if (!this.gridContainer || !catalogCache) return;
+        const prevScroll = this.gridContainer.scrollTop;
         this.thumbQueue.reset(this.gridContainer);
 
         if (this.selectedPack) {
             this._renderScenesView(this.selectedPack);
         } else {
             this._renderPacksView();
+        }
+
+        if (typeof options.scrollTop === "number") {
+            this.gridContainer.scrollTop = options.scrollTop;
+        } else if (options.preserveScroll) {
+            this.gridContainer.scrollTop = prevScroll;
         }
     }
 
@@ -949,6 +1211,7 @@ class HomelabMapBrowser extends BaseApp {
 
         this.backButton.style.display = "none";
         this.catSelect.style.display = "";
+        this.packImportHeaderBtn.style.display = "none";
         this.gridContainer.innerHTML = "";
 
         const packs = catalogCache.packs || [];
@@ -957,30 +1220,17 @@ class HomelabMapBrowser extends BaseApp {
         for (const pack of packs) {
             if (this.filterCategory !== "all" && pack.category !== this.filterCategory) continue;
 
-            const cleanTitle = getCleanPackTitle(pack);
-            const sortKey = getSortKey(pack);
-            const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
-
             if (this.searchQuery) {
-                const matchTitle = cleanTitle.toLowerCase().includes(this.searchQuery) ||
-                (pack.title || "").toLowerCase().includes(this.searchQuery);
-                const matchId = (pack.moduleId || "").toLowerCase().includes(this.searchQuery);
-                const matchScene = packScenes.some(s => (s.name || "").toLowerCase().includes(this.searchQuery));
-                if (!matchTitle && !matchId && !matchScene) continue;
+                const searchBlob = pack._searchBlob || "";
+                if (!searchBlob.includes(this.searchQuery)) continue;
             }
 
             const status = getPackStatus(pack, worldIndex);
             if (this.filterStatus === "imported" && !status.isImported) continue;
             if (this.filterStatus === "not-imported" && status.isImported) continue;
 
-            filtered.push({ pack, status, cleanTitle, sortKey });
+            filtered.push({ pack, status, cleanTitle: getCleanPackTitle(pack) });
         }
-
-        filtered.sort((a, b) => {
-            const cmp = naturalCollator.compare(a.sortKey, b.sortKey);
-            if (cmp !== 0) return cmp;
-            return naturalCollator.compare(a.cleanTitle, b.cleanTitle);
-        });
 
         this.countElement.textContent = `${game.i18n.localize("ZMB.Displayed")}: ${filtered.length} / ${packs.length}`;
 
@@ -996,11 +1246,14 @@ class HomelabMapBrowser extends BaseApp {
             const tile = document.createElement("div");
             tile.className = `zmb-tile ${status.isImported ? "is-imported" : ""}`;
 
-            const versionStr = pack.version ? `v${pack.version}` : "v1.0";
+            const versionStr = foundry.utils.escapeHTML(pack.version ? `v${pack.version}` : "v1.0");
             const coverCandidates = getPackCoverCandidates(baseUrl, pack);
-            const primaryThumbUrl = coverCandidates[0] || "icons/svg/adastra.svg";
+            const primaryThumbUrl = coverCandidates[0] || FALLBACK_THUMB;
+            const safeTitle = foundry.utils.escapeHTML(cleanTitle);
 
-            const catLabel = pack.category === "scene" ? game.i18n.localize("ZMB.SceneType") : game.i18n.localize("ZMB.MapType");
+            const isSceneCat = pack.category === "scene";
+            const catLabel = isSceneCat ? game.i18n.localize("ZMB.SceneType") : game.i18n.localize("ZMB.MapType");
+            const catClass = isSceneCat ? "cat-scene" : "cat-map";
 
             let statusLabel = game.i18n.localize("ZMB.NotImportedLabel");
             let statusClass = "";
@@ -1014,15 +1267,18 @@ class HomelabMapBrowser extends BaseApp {
 
             tile.innerHTML = `
             <div class="zmb-thumb">
-            <img data-src="${primaryThumbUrl}" alt="${cleanTitle}" />
+            <img data-src="${foundry.utils.escapeHTML(primaryThumbUrl)}" alt="${safeTitle}" />
             <div class="zmb-meta-overlay">
-            <span class="zmb-tag">${catLabel} • ${status.totalCount}</span>
+            <span class="zmb-tag ${catClass}">${catLabel} • ${status.totalCount}</span>
             <span class="zmb-tag">${versionStr}</span>
             </div>
-            <div class="zmb-status-bar ${statusClass}">${statusLabel}</div>
+            <div class="zmb-status-bar ${statusClass}">
+            <span class="zmb-status-text">${statusLabel}</span>
+            <div class="zmb-progress-fill" style="width: 0%;"></div>
+            </div>
             </div>
             <div class="zmb-body">
-            <div class="zmb-title" title="${cleanTitle}">${cleanTitle}</div>
+            <div class="zmb-title" title="${safeTitle}">${safeTitle}</div>
             <div class="zmb-actions">
             <button type="button" class="zmb-import-pack" ${status.isFullyImported ? "disabled" : ""}>
             <i class="fa-solid ${status.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
@@ -1039,27 +1295,25 @@ class HomelabMapBrowser extends BaseApp {
             imgEl._fallbacks = coverCandidates.slice(1);
             imagesToQueue.push(imgEl);
 
-            tile.querySelector(".zmb-thumb").addEventListener("click", () => {
-                this.selectedPack = pack;
-                this.refreshGridOnly();
-            });
-
-            tile.querySelector(".zmb-view-scenes").addEventListener("click", () => {
-                this.selectedPack = pack;
-                this.refreshGridOnly();
-            });
+            tile.querySelector(".zmb-thumb").addEventListener("click", () => this._openPack(pack));
+            tile.querySelector(".zmb-view-scenes").addEventListener("click", () => this._openPack(pack));
 
             tile.querySelector(".zmb-import-pack").addEventListener("click", async (ev) => {
                 const btn = ev.currentTarget;
+                const progressFill = tile.querySelector(".zmb-progress-fill");
                 btn.disabled = true;
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
                 try {
                     await importPackToWorld(pack, (current, total) => {
                         btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`;
+                        if (progressFill && total > 0) {
+                            progressFill.style.width = `${Math.round((current / total) * 100)}%`;
+                        }
                     });
-                    this.refreshGridOnly();
+                    this.refreshGridOnly({ preserveScroll: true });
                 } catch (err) {
                     ui.notifications.error(err.message);
+                    if (progressFill) progressFill.style.width = "0%";
                     btn.disabled = false;
                     btn.innerHTML = `<i class="fa-solid fa-file-import"></i> ${game.i18n.localize("ZMB.Import")}`;
                 }
@@ -1077,110 +1331,139 @@ class HomelabMapBrowser extends BaseApp {
     _renderScenesView(pack) {
         const baseUrl = getServerUrl();
         const worldIndex = buildWorldSceneIndex();
+        const packStatus = getPackStatus(pack, worldIndex);
 
         this.backButton.style.display = "";
         this.catSelect.style.display = "none";
-        this.gridContainer.innerHTML = "";
-
-        const cleanTitle = getCleanPackTitle(pack);
-        const versionStr = pack.version ? `v${pack.version}` : "v1.0";
-        const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
-        const scenes = [];
-
-        for (const sceneMeta of packScenes) {
-            const sName = sceneMeta.name || "Scena";
-            if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
-
-            const worldScene = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
-            const isImported = Boolean(worldScene);
-
-            if (this.filterStatus === "imported" && !isImported) continue;
-            if (this.filterStatus === "not-imported" && isImported) continue;
-
-            scenes.push({ sceneMeta, worldScene, isImported });
-        }
-
-        scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
-
-        this.countElement.textContent = `${cleanTitle} (${versionStr}) — ${game.i18n.localize("ZMB.Scenes")}: ${scenes.length} / ${getPackTotalCount(pack)}`;
-
-        const fragment = document.createDocumentFragment();
-        const imagesToQueue = [];
-
-        for (const { sceneMeta, worldScene, isImported } of scenes) {
-            const tile = document.createElement("div");
-            tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
-            const thumbCandidates = getSceneThumbCandidates(baseUrl, pack, sceneMeta);
-            const primaryThumbUrl = thumbCandidates[0] || "icons/svg/adastra.svg";
-            const sceneName = sceneMeta.name || "Scena";
-
-            const itemStatus = isImported ? game.i18n.localize("ZMB.ImportedLabel") : game.i18n.localize("ZMB.NotImportedLabel");
-
-            tile.innerHTML = `
-            <div class="zmb-thumb">
-            <img data-src="${primaryThumbUrl}" alt="${sceneName}" />
-            <div class="zmb-meta-overlay">
-            <span class="zmb-tag">${sceneMeta.width || "?"}×${sceneMeta.height || "?"}</span>
-            <span class="zmb-tag">${versionStr}</span>
-            </div>
-            <div class="zmb-status-bar ${isImported ? "imported" : ""}">
-            ${itemStatus}
-            </div>
-            </div>
-            <div class="zmb-body">
-            <div class="zmb-title" title="${sceneName}">${sceneName}</div>
-            <div class="zmb-actions">
-            <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
-            <i class="fa-solid ${isImported ? "fa-check" : "fa-download"}"></i>
-            ${isImported ? game.i18n.localize("ZMB.InWorld") : game.i18n.localize("ZMB.Import")}
-            </button>
-            <button type="button" class="zmb-open-scene">
-            <i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}
-            </button>
-            </div>
-            </div>
+        this.packImportHeaderBtn.style.display = "";
+        this.packImportHeaderBtn.disabled = packStatus.isFullyImported;
+        this.packImportHeaderBtn.innerHTML = `
+        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
+        ${packStatus.isFullyImported
+            ? `${game.i18n.localize("ZMB.InWorld")} (${packStatus.importedCount}/${packStatus.totalCount})`
+            : `${game.i18n.localize("ZMB.ImportPackBtn")} (${packStatus.importedCount}/${packStatus.totalCount})`}
             `;
 
-            const imgEl = tile.querySelector("img");
-            imgEl._fallbacks = thumbCandidates.slice(1);
-            imagesToQueue.push(imgEl);
+            this.gridContainer.innerHTML = "";
 
-            tile.querySelector(".zmb-import-scene").addEventListener("click", async (ev) => {
-                const btn = ev.currentTarget;
-                btn.disabled = true;
-                btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                try {
-                    await importSingleSceneToWorld(pack, sceneMeta);
-                    this.refreshGridOnly();
-                } catch (err) {
-                    ui.notifications.error(err.message);
-                    btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-download"></i> ${game.i18n.localize("ZMB.Import")}`;
-                }
-            });
+            const cleanTitle = getCleanPackTitle(pack);
+            const versionStr = foundry.utils.escapeHTML(pack.version ? `v${pack.version}` : "v1.0");
+            const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
+            const defaultSceneLabel = game.i18n.localize("ZMB.SceneDefaultName");
+            const previewHintTitle = foundry.utils.escapeHTML(game.i18n.localize("ZMB.PreviewImage"));
+            const scenes = [];
 
-            tile.querySelector(".zmb-open-scene").addEventListener("click", async (ev) => {
-                const btn = ev.currentTarget;
-                btn.disabled = true;
-                btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                try {
-                    const targetScene = worldScene || (await importSingleSceneToWorld(pack, sceneMeta));
-                    this.refreshGridOnly();
-                    if (targetScene) targetScene.view();
-                } catch (err) {
-                    ui.notifications.error(err.message);
-                } finally {
-                    btn.disabled = false;
-                    btn.innerHTML = `<i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}`;
-                }
-            });
+            for (const sceneMeta of packScenes) {
+                const sName = sceneMeta.name || defaultSceneLabel;
+                if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
 
-            fragment.appendChild(tile);
-        }
+                const worldScene = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
+                const isImported = Boolean(worldScene);
 
-        this.gridContainer.appendChild(fragment);
-        for (const img of imagesToQueue) {
-            this.thumbQueue.observe(img);
-        }
+                if (this.filterStatus === "imported" && !isImported) continue;
+                if (this.filterStatus === "not-imported" && isImported) continue;
+
+                scenes.push({ sceneMeta, worldScene, isImported });
+            }
+
+            scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
+
+            this.countElement.textContent = `${cleanTitle} (${pack.version ? `v${pack.version}` : "v1.0"}) — ${game.i18n.localize("ZMB.Scenes")}: ${scenes.length} / ${getPackTotalCount(pack)}`;
+
+            if (scenes.length === 0) {
+                this.gridContainer.innerHTML = `<div class="zmb-empty" style="grid-column: 1 / -1;">${game.i18n.localize("ZMB.NoResults")}</div>`;
+                return;
+            }
+
+            const fragment = document.createDocumentFragment();
+            const imagesToQueue = [];
+
+            for (const { sceneMeta, worldScene, isImported } of scenes) {
+                const tile = document.createElement("div");
+                tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
+                const thumbCandidates = getSceneThumbCandidates(baseUrl, pack, sceneMeta);
+                const primaryThumbUrl = thumbCandidates[0] || FALLBACK_THUMB;
+                const sceneName = sceneMeta.name || defaultSceneLabel;
+                const safeSceneName = foundry.utils.escapeHTML(sceneName);
+
+                const itemStatus = isImported ? game.i18n.localize("ZMB.ImportedLabel") : game.i18n.localize("ZMB.NotImportedLabel");
+
+                tile.innerHTML = `
+                <div class="zmb-thumb" title="${previewHintTitle}">
+                <img data-src="${foundry.utils.escapeHTML(primaryThumbUrl)}" alt="${safeSceneName}" />
+                <div class="zmb-meta-overlay">
+                <span class="zmb-tag">${Number(sceneMeta.width) || "?"}×${Number(sceneMeta.height) || "?"}</span>
+                <span class="zmb-tag">${versionStr}</span>
+                </div>
+                <div class="zmb-preview-hint"><i class="fa-solid fa-magnifying-glass-plus"></i></div>
+                <div class="zmb-status-bar ${isImported ? "imported" : ""}">
+                <span class="zmb-status-text">${itemStatus}</span>
+                </div>
+                </div>
+                <div class="zmb-body">
+                <div class="zmb-title" title="${safeSceneName}">${safeSceneName}</div>
+                <div class="zmb-actions">
+                <button type="button" class="zmb-import-scene" ${isImported ? "disabled" : ""}>
+                <i class="fa-solid ${isImported ? "fa-check" : "fa-download"}"></i>
+                ${isImported ? game.i18n.localize("ZMB.InWorld") : game.i18n.localize("ZMB.Import")}
+                </button>
+                <button type="button" class="zmb-open-scene">
+                <i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}
+                </button>
+                </div>
+                </div>
+                `;
+
+                const imgEl = tile.querySelector("img");
+                imgEl._fallbacks = thumbCandidates.slice(1);
+                imagesToQueue.push(imgEl);
+
+                tile.querySelector(".zmb-thumb").addEventListener("click", () => {
+                    const previewUrl = resolveAssetUrl(baseUrl, sceneMeta.bg || sceneMeta.thumb, pack.moduleId);
+                    openImagePreview(previewUrl, sceneName);
+                });
+
+                tile.querySelector(".zmb-import-scene").addEventListener("click", async (ev) => {
+                    const btn = ev.currentTarget;
+                    btn.disabled = true;
+                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+                    try {
+                        await importSingleSceneToWorld(pack, sceneMeta);
+                        this.refreshGridOnly({ preserveScroll: true });
+                    } catch (err) {
+                        ui.notifications.error(err.message);
+                        if (btn.isConnected) {
+                            btn.disabled = false;
+                            btn.innerHTML = `<i class="fa-solid fa-download"></i> ${game.i18n.localize("ZMB.Import")}`;
+                        }
+                    }
+                });
+
+                tile.querySelector(".zmb-open-scene").addEventListener("click", async (ev) => {
+                    const btn = ev.currentTarget;
+                    btn.disabled = true;
+                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+                    try {
+                        const currentWorldIndex = buildWorldSceneIndex();
+                        const existingScene = findWorldScene(currentWorldIndex, pack.moduleId, sceneMeta.id);
+                        const targetScene = existingScene || (await importSingleSceneToWorld(pack, sceneMeta));
+                        this.refreshGridOnly({ preserveScroll: true });
+                        if (targetScene) targetScene.view();
+                    } catch (err) {
+                        ui.notifications.error(err.message);
+                        if (btn.isConnected) {
+                            btn.disabled = false;
+                            btn.innerHTML = `<i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}`;
+                        }
+                    }
+                });
+
+                fragment.appendChild(tile);
+            }
+
+            this.gridContainer.appendChild(fragment);
+            for (const img of imagesToQueue) {
+                this.thumbQueue.observe(img);
+            }
     }
 }

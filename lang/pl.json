@@ -19,6 +19,8 @@
   "ZMB.PartialLabel": "Częściowo",
   "ZMB.InWorld": "W świecie",
   "ZMB.Import": "Importuj",
+  "ZMB.ImportPackBtn": "Importuj paczkę",
+  "ZMB.PreviewImage": "Kliknij, aby otworzyć podgląd w pełnej rozdzielczości",
   "ZMB.Scenes": "Sceny",
   "ZMB.Open": "Otwórz",
   "ZMB.SceneType": "Scena",
@@ -33,5 +35,10 @@
   "ZMB.PackImportedWarn": "Zaimportowano {count} scen z \"{title}\" (pominięto {skipped} brakujących plików na serwerze).",
   "ZMB.SceneImportedInfo": "Zaimportowano scenę: {name}",
   "ZMB.AllScenesImported": "Wszystkie sceny z paczki \"{title}\" są już w świecie.",
-  "ZMB.CatalogError": "Serwer zwrócił kod HTTP {status}"
+  "ZMB.CatalogError": "Serwer zwrócił kod HTTP {status}",
+  "ZMB.SceneDefaultName": "Scena",
+  "ZMB.DownloadAssetError": "Nie udało się pobrać pliku (HTTP {status}): {url}",
+  "ZMB.PackImportAllFailed": "Nie udało się pobrać żadnej sceny z paczki \"{title}\".",
+  "ZMB.SceneNotFoundInJson": "Nie znaleziono wybranej sceny w pliku scenes.json.",
+  "ZMB.SceneCreateError": "Nie udało się utworzyć sceny \"{name}\"."
 }

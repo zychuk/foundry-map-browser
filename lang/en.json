@@ -19,6 +19,8 @@
   "ZMB.PartialLabel": "Partial",
   "ZMB.InWorld": "In World",
   "ZMB.Import": "Import",
+  "ZMB.ImportPackBtn": "Import Pack",
+  "ZMB.PreviewImage": "Click to preview full-resolution image",
   "ZMB.Scenes": "Scenes",
   "ZMB.Open": "Open",
   "ZMB.SceneType": "Scene",
@@ -33,5 +35,10 @@
   "ZMB.PackImportedWarn": "Imported {count} scenes from \"{title}\" ({skipped} missing files on server were skipped).",
   "ZMB.SceneImportedInfo": "Imported scene: {name}",
   "ZMB.AllScenesImported": "All scenes from package \"{title}\" are already in the world.",
-  "ZMB.CatalogError": "Server returned HTTP status {status}"
+  "ZMB.CatalogError": "Server returned HTTP status {status}",
+  "ZMB.SceneDefaultName": "Scene",
+  "ZMB.DownloadAssetError": "Failed to download file (HTTP {status}): {url}",
+  "ZMB.PackImportAllFailed": "Failed to import any scenes from pack \"{title}\".",
+  "ZMB.SceneNotFoundInJson": "Selected scene was not found in scenes.json.",
+  "ZMB.SceneCreateError": "Failed to create scene \"{name}\"."
 }

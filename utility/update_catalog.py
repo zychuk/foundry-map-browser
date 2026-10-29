@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
 Skrypt B: Bezpieczna aktualizacja pliku catalog.json.
-- Skanuje katalog modules/ i wykrywa nowe moduły.
+- Skanuje katalog modules/ i wykrywa nowe moduły (oraz opcjonalnie aktualizuje istniejące).
 - Tworzy kopię zapasową catalog.json przed jakąkolwiek zmianą.
-- Nie duplikuje wpisów (sprawdza po moduleId, tytule oraz ścieżkach).
+- Nie duplikuje wpisów (sprawdza po moduleId oraz parze tytuł+kategoria).
 - Dla nowych (oraz opcjonalnie uszkodzonych) modułów automatycznie ustawia jako okładkę
   pierwszy istniejący plik graficzny w folderze _thumbs/ (o ile nie podano jawnie poprawnej ścieżki).
-- Przed zapisem weryfikuje poprawność składniową JSON i zapisuje plik atomowo.
+- Przed zapisem sortuje paczki deterministycznie, weryfikuje składnię JSON i zapisuje plik atomowo.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +31,22 @@ def ask_user(prompt_text: str, default_val: str = "", non_interactive: bool = Fa
     except (EOFError, KeyboardInterrupt):
         print("\n[!] Przerwano przez użytkownika.")
         sys.exit(1)
+
+
+def extract_bg_from_scene(r: dict) -> str | None:
+    if not isinstance(r, dict):
+        return None
+    bg = (r.get("background") or {}).get("src") if isinstance(r.get("background"), dict) else None
+    if bg:
+        return bg
+    if r.get("img"):
+        return r.get("img")
+    levels = r.get("levels")
+    if isinstance(levels, list) and levels and isinstance(levels[0], dict):
+        lvl_bg = (levels[0].get("background") or {}).get("src") if isinstance(levels[0].get("background"), dict) else None
+        if lvl_bg:
+            return lvl_bg
+    return r.get("bg")
 
 
 def find_first_thumbnail_in_module(root_dir: Path, module_dir: Path, scenes_list: list) -> str:
@@ -54,6 +71,26 @@ def find_first_thumbnail_in_module(root_dir: Path, module_dir: Path, scenes_list
         return all_imgs[0].relative_to(root_dir).as_posix()
 
     return ""
+
+
+def resolve_scene_thumb(root_dir: Path, module_id: str, raw_thumb: str | None, bg: str) -> str:
+    if raw_thumb and (root_dir / raw_thumb).is_file():
+        return raw_thumb
+
+    bg_path = Path(bg)
+    parts = bg_path.parts
+    rel_inside_mod = "/".join(parts[2:]) if len(parts) > 2 and parts[0].lower() == "modules" else bg
+    rel_hash = hashlib.md5(rel_inside_mod.encode("utf-8")).hexdigest()[:8]
+
+    hashed_candidate = f"modules/{module_id}/_thumbs/{bg_path.stem}_{rel_hash}.webp"
+    if (root_dir / hashed_candidate).is_file():
+        return hashed_candidate
+
+    plain_candidate = f"modules/{module_id}/_thumbs/{bg_path.stem}.webp"
+    if (root_dir / plain_candidate).is_file():
+        return plain_candidate
+
+    return bg
 
 
 def build_pack_entry(root_dir: Path, module_dir: Path, non_interactive: bool = False):
@@ -98,20 +135,15 @@ def build_pack_entry(root_dir: Path, module_dir: Path, non_interactive: bool = F
     for r in raw_scenes:
         s_id = r.get("_id") or r.get("id")
         s_name = r.get("name") or "Scena"
-        bg = (r.get("background") or {}).get("src") if isinstance(r.get("background"), dict) else None
-        bg = bg or r.get("img") or r.get("bg")
+        bg = extract_bg_from_scene(r)
         if not bg:
             continue
 
-        # Upewnij się, że plik istnieje na dysku
         if not (root_dir / bg).is_file():
             print(f"   [!] Pominięto scenę '{s_name}' w '{module_id}' (brak pliku: {bg})")
             continue
 
-        thumb = r.get("thumb")
-        if not thumb or not (root_dir / thumb).is_file():
-            candidate_thumb = f"modules/{module_id}/_thumbs/{Path(bg).stem}.webp"
-            thumb = candidate_thumb if (root_dir / candidate_thumb).is_file() else bg
+        thumb = resolve_scene_thumb(root_dir, module_id, r.get("thumb"), bg)
 
         catalog_scenes.append({
             "id": s_id,
@@ -125,8 +157,6 @@ def build_pack_entry(root_dir: Path, module_dir: Path, non_interactive: bool = F
     if not catalog_scenes:
         return None, "brak poprawnych scen z istniejącymi plikami na dysku"
 
-    # Jeśli jawnie podano cover w module.json i plik istnieje -> ma pierwszeństwo,
-    # w przeciwnym razie wybierz pierwszy plik graficzny z _thumbs/
     explicit_cover = manifest.get("cover")
     if explicit_cover and (root_dir / explicit_cover).is_file():
         cover = explicit_cover
@@ -158,6 +188,16 @@ def main():
         action="store_true",
         help="Napraw również brakujące okładki (cover) w już istniejących wpisach catalog.json.",
     )
+    parser.add_argument(
+        "--update-existing",
+        action="store_true",
+        help="Odśwież wpisy modułów, które już istnieją w catalog.json, jeśli zmieniły się ich sceny lub metadane.",
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Usuń z catalog.json wpisy modułów, których katalogi nie istnieją już na dysku.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Pokaż zmiany bez modyfikowania catalog.json.")
     parser.add_argument("--non-interactive", action="store_true", help="Nie pytaj w konsoli, użyj wartości domyślnych.")
     args = parser.parse_args()
@@ -180,8 +220,25 @@ def main():
         catalog = {"totalPacks": 0, "packs": []}
 
     existing_packs = catalog.get("packs", [])
-    existing_ids = {p.get("moduleId", "").lower() for p in existing_packs if p.get("moduleId")}
-    existing_titles = {p.get("title", "").lower() for p in existing_packs if p.get("title")}
+    pruned_count = 0
+
+    if args.prune:
+        kept_packs = []
+        for p in existing_packs:
+            mod_id = p.get("moduleId")
+            if mod_id and (modules_dir / mod_id).is_dir():
+                kept_packs.append(p)
+            else:
+                pruned_count += 1
+                print(f"[USUNIĘTO WPIS] {mod_id} (brak katalogu na dysku)")
+        existing_packs = kept_packs
+
+    existing_by_id = {p.get("moduleId", "").lower(): idx for idx, p in enumerate(existing_packs) if p.get("moduleId")}
+    existing_title_cats = {
+        (p.get("title", "").lower(), p.get("category", "map"))
+        for p in existing_packs
+        if p.get("title")
+    }
 
     fixed_covers_count = 0
     if args.fix_missing_covers:
@@ -198,11 +255,28 @@ def main():
             p["sceneCount"] = len(p.get("scenes", []))
 
     added_packs = []
+    updated_packs = []
     skipped_modules = []
 
     for mod_dir in sorted([d for d in modules_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]):
         mod_id = mod_dir.name
-        if mod_id.lower() in existing_ids:
+        mod_key = mod_id.lower()
+
+        if mod_key in existing_by_id:
+            if not args.update_existing:
+                continue
+
+            entry, reason = build_pack_entry(root_dir, mod_dir, args.non_interactive)
+            if not entry:
+                skipped_modules.append((mod_id, reason))
+                continue
+
+            idx = existing_by_id[mod_key]
+            old_entry = existing_packs[idx]
+            if old_entry != entry:
+                existing_packs[idx] = entry
+                updated_packs.append(entry)
+                print(f"[ZAKTUALIZOWANO] {entry['moduleId']} (scen: {entry['sceneCount']}, v{entry['version']})")
             continue
 
         entry, reason = build_pack_entry(root_dir, mod_dir, args.non_interactive)
@@ -210,35 +284,38 @@ def main():
             skipped_modules.append((mod_id, reason))
             continue
 
-        if entry["title"].lower() in existing_titles:
-            print(f"[UWAGA] Moduł '{mod_id}' ma taki sam tytuł jak istniejący wpis ('{entry['title']}').")
+        title_cat_key = (entry["title"].lower(), entry["category"])
+        if title_cat_key in existing_title_cats:
+            print(f"[UWAGA] Moduł '{mod_id}' ma taki sam tytuł i kategorię jak istniejący wpis ('{entry['title']}').")
             ans = ask_user("Czy mimo to dodać ten moduł? (t/n)", "n", args.non_interactive)
             if ans.lower() not in ("t", "tak", "y", "yes"):
                 skipped_modules.append((mod_id, "duplikat tytułu"))
                 continue
 
         existing_packs.append(entry)
-        existing_ids.add(mod_id.lower())
-        existing_titles.add(entry["title"].lower())
+        existing_by_id[mod_key] = len(existing_packs) - 1
+        existing_title_cats.add(title_cat_key)
         added_packs.append(entry)
         print(f"[DODANO] {entry['moduleId']} ('{entry['title']}', scen: {entry['sceneCount']}, cover: {entry['cover']})")
 
     print("\n=== Podsumowanie skanowania ===")
-    print(f" * Istniejące paczki w katalogu: {len(existing_packs) - len(added_packs)}")
+    print(f" * Łącznie paczek w katalogu:    {len(existing_packs)}")
     print(f" * Nowo wykryte i dodane:        {len(added_packs)}")
+    print(f" * Zaktualizowane istniejące:    {len(updated_packs)}")
+    print(f" * Usunięte martwe wpisy:        {pruned_count}")
     print(f" * Naprawione okładki (cover):   {fixed_covers_count}")
     print(f" * Pominięte foldery:            {len(skipped_modules)}")
     for m_id, reason in skipped_modules:
         print(f"   - {m_id}: {reason}")
 
-    if not added_packs and fixed_covers_count == 0:
+    if not added_packs and not updated_packs and pruned_count == 0 and fixed_covers_count == 0:
         print("[INFO] Brak zmian do zapisania w catalog.json.")
         return
 
+    existing_packs.sort(key=lambda p: (p.get("moduleId") or "").lower())
     catalog["packs"] = existing_packs
     catalog["totalPacks"] = len(existing_packs)
 
-    # Walidacja składni wynikowego JSON przed jakimkolwiek zapisem
     try:
         serialized = json.dumps(catalog, ensure_ascii=False, indent=2)
         json.loads(serialized)
@@ -250,18 +327,15 @@ def main():
         print("[DRY-RUN] Walidacja JSON pomyślna. Plik catalog.json nie został zmodyfikowany.")
         return
 
-    # 1. Backup obecnego catalog.json
     if catalog_path.is_file():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = root_dir / f"catalog.json.bak.{timestamp}"
         shutil.copy2(catalog_path, backup_path)
         print(f"[BACKUP] Utworzono kopię zapasową: {backup_path.name}")
 
-    # 2. Atomowy zapis przez plik tymczasowy
     tmp_catalog = root_dir / f"catalog.json.tmp.{os.getpid()}"
     try:
         tmp_catalog.write_text(serialized, encoding="utf-8")
-        # Dodatkowa weryfikacja zapisanego pliku na dysku
         json.loads(tmp_catalog.read_text(encoding="utf-8"))
         os.replace(tmp_catalog, catalog_path)
         print(f"[SUKCES] Zaktualizowano plik {catalog_path} (łącznie paczek: {catalog['totalPacks']}).")

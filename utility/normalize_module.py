@@ -4,10 +4,12 @@ Skrypt A: Normalizacja surowego folderu z mapami lub modułu Foundry VTT.
 - Zawsze pracuje na kopii (nigdy nie modyfikuje katalogu wejściowego).
 - Obsługuje zarówno moduły Foundry (module.json, packs/*.db, scenes.json),
   jak i surowe foldery ze zwykłymi plikami graficznymi (.jpg, .png, .webp).
+- Generuje miniatury .webp wielowątkowo na wszystkich rdzeniach CPU.
 - Obsługuje tryb --dry-run oraz tryb interaktywny.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -17,7 +19,16 @@ import string
 import struct
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import unquote
+
+try:
+    from PIL import Image, ImageOps
+    Image.MAX_IMAGE_PIXELS = None
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -37,6 +48,18 @@ def ask_user(prompt_text: str, default_val: str = "", non_interactive: bool = Fa
 def random_foundry_id(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits
     return "".join(random.choice(chars) for _ in range(length))
+
+
+def deterministic_foundry_id(seed_str: str, length: int = 16) -> str:
+    """Generuje deterministyczne 16-znakowe ID na podstawie ścieżki, aby ponowna normalizacja zachowywała te same ID."""
+    chars = string.ascii_letters + string.digits
+    digest = hashlib.sha256(seed_str.encode("utf-8")).digest()
+    return "".join(chars[b % len(chars)] for b in digest[:length])
+
+
+def build_thumb_filename(rel_file_posix: str, stem: str) -> str:
+    rel_hash = hashlib.md5(rel_file_posix.encode("utf-8")).hexdigest()[:8]
+    return f"{stem}_{rel_hash}.webp"
 
 
 def get_image_dimensions(file_path: Path):
@@ -102,56 +125,119 @@ def get_image_dimensions(file_path: Path):
     return 4000, 3000
 
 
-def resolve_file_in_module(module_dir: Path, raw_path: str):
-    """Szuka pliku wewnątrz kopii modułu (niezależnie od wielkości liter i prefiksu modules/<id>/)."""
-    if not raw_path or not isinstance(raw_path, str):
+class ModuleFileIndex:
+    """Szybki indeks plików wewnątrz katalogu modułu (case-insensitive)."""
+
+    def __init__(self, module_dir: Path):
+        self.module_dir = module_dir
+        self.by_rel_lower = {}
+        self.by_filename_lower = {}
+
+        for p in sorted(module_dir.rglob("*")):
+            if not p.is_file() or "_thumbs" in p.parts:
+                continue
+            rel_posix = p.relative_to(module_dir).as_posix()
+            self.by_rel_lower[rel_posix.lower()] = p
+            fname_lower = p.name.lower()
+            if fname_lower not in self.by_filename_lower:
+                self.by_filename_lower[fname_lower] = p
+
+    def resolve(self, raw_path: str) -> Path | None:
+        if not raw_path or not isinstance(raw_path, str):
+            return None
+        clean = raw_path.strip().lstrip("/")
+        if clean.startswith(("http://", "https://", "data:", "icons/", "ui/")):
+            return None
+        try:
+            clean = unquote(clean)
+        except Exception:
+            pass
+
+        parts = list(Path(clean).parts)
+        if len(parts) >= 2 and parts[0].lower() in ("modules", "worlds"):
+            parts = parts[2:]
+
+        if not parts:
+            return None
+
+        # 1. Dokładna ścieżka
+        candidate = self.module_dir.joinpath(*parts)
+        if candidate.is_file():
+            return candidate
+
+        # 2. Ścieżka względna bez względu na wielkość liter
+        rel_key = "/".join(parts).lower()
+        if rel_key in self.by_rel_lower:
+            return self.by_rel_lower[rel_key]
+
+        # 3. Dopasowanie po samej nazwie pliku
+        return self.by_filename_lower.get(parts[-1].lower())
+
+
+def extract_bg_from_raw_scene(raw: dict) -> str | None:
+    if not isinstance(raw, dict):
         return None
-    clean = raw_path.strip().lstrip("/")
-    try:
-        from urllib.parse import unquote
-        clean = unquote(clean)
-    except Exception:
-        pass
-
-    parts = list(Path(clean).parts)
-    if len(parts) >= 2 and parts[0].lower() == "modules":
-        parts = parts[2:]
-
-    if not parts:
-        return None
-
-    # 1. Dokładna ścieżka
-    candidate = module_dir.joinpath(*parts)
-    if candidate.is_file():
-        return candidate
-
-    # 2. Dopasowanie bez względu na wielkość liter (case-insensitive)
-    curr = module_dir
-    for part in parts:
-        if not curr.is_dir():
-            curr = None
-            break
-        match = next((p for p in curr.iterdir() if p.name.lower() == part.lower()), None)
-        if not match:
-            curr = None
-            break
-        curr = match
-    if curr and curr.is_file():
-        return curr
-
-    # 3. Dopasowanie po samej nazwie pliku w całym folderze modułu
-    target_filename = parts[-1].lower()
-    for p in module_dir.rglob("*"):
-        if p.is_file() and p.parent.name != "_thumbs" and p.name.lower() == target_filename:
-            return p
-
+    bg_obj = raw.get("background")
+    if isinstance(bg_obj, dict) and bg_obj.get("src"):
+        return bg_obj.get("src")
+    if isinstance(raw.get("img"), str) and raw.get("img"):
+        return raw.get("img")
+    levels = raw.get("levels")
+    if isinstance(levels, list) and levels:
+        first_lvl = levels[0]
+        if isinstance(first_lvl, dict):
+            lvl_bg = (first_lvl.get("background") or {}).get("src") if isinstance(first_lvl.get("background"), dict) else None
+            if lvl_bg:
+                return lvl_bg
+    if isinstance(raw.get("bg"), str) and raw.get("bg"):
+        return raw.get("bg")
     return None
+
+
+def normalize_subasset_paths(raw: dict, file_index: ModuleFileIndex, module_id: str):
+    """Normalizuje wielkość liter i prefiks modules/<id>/ dla kafelków, tokenów, dźwięków i poziomów."""
+    def to_canonical(path_str: str) -> str:
+        resolved = file_index.resolve(path_str)
+        if resolved:
+            return f"modules/{module_id}/{resolved.relative_to(file_index.module_dir).as_posix()}"
+        return path_str
+
+    if isinstance(raw.get("foreground"), str) and raw["foreground"]:
+        raw["foreground"] = to_canonical(raw["foreground"])
+
+    for key in ("tiles", "tokens"):
+        items = raw.get(key)
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                tex = item.get("texture")
+                if isinstance(tex, dict) and isinstance(tex.get("src"), str) and tex["src"]:
+                    tex["src"] = to_canonical(tex["src"])
+                elif isinstance(item.get("img"), str) and item["img"]:
+                    item["texture"] = {"src": to_canonical(item["img"])}
+                    del item["img"]
+
+    sounds = raw.get("sounds")
+    if isinstance(sounds, list):
+        for s in sounds:
+            if isinstance(s, dict) and isinstance(s.get("path"), str) and s["path"]:
+                s["path"] = to_canonical(s["path"])
+
+    levels = raw.get("levels")
+    if isinstance(levels, list):
+        for lvl in levels:
+            if not isinstance(lvl, dict):
+                continue
+            lvl_bg = lvl.get("background")
+            if isinstance(lvl_bg, dict) and isinstance(lvl_bg.get("src"), str) and lvl_bg["src"]:
+                lvl_bg["src"] = to_canonical(lvl_bg["src"])
 
 
 def generate_webp_thumbnail(src_image: Path, dest_webp: Path) -> bool:
     """Generuje miniaturkę .webp używając cwebp, ffmpeg lub Pillow (jeśli dostępne)."""
     dest_webp.parent.mkdir(parents=True, exist_ok=True)
-    if dest_webp.is_file():
+    if dest_webp.is_file() and dest_webp.stat().st_size > 0:
         return True
 
     if shutil.which("cwebp"):
@@ -160,56 +246,80 @@ def generate_webp_thumbnail(src_image: Path, dest_webp: Path) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        if res.returncode == 0 and dest_webp.is_file():
+        if res.returncode == 0 and dest_webp.is_file() and dest_webp.stat().st_size > 0:
             return True
 
     if shutil.which("ffmpeg"):
         res = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(src_image), "-vf", "scale=480:-1", "-q:v", "75", str(dest_webp)],
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(src_image),
+                "-frames:v", "1",
+                "-vf", "scale=480:-1",
+                "-q:v", "75",
+                str(dest_webp),
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        if res.returncode == 0 and dest_webp.is_file():
+        if res.returncode == 0 and dest_webp.is_file() and dest_webp.stat().st_size > 0:
             return True
 
-    try:
-        from PIL import Image
-        with Image.open(src_image) as im:
-            im.thumbnail((480, 480))
-            im.save(dest_webp, "WEBP", quality=80)
-        return True
-    except Exception:
-        pass
+    if HAS_PILLOW:
+        try:
+            with Image.open(src_image) as im:
+                im = ImageOps.exif_transpose(im)
+                if im.mode not in ("RGB", "RGBA"):
+                    im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+                im.thumbnail((480, 480), Image.Resampling.LANCZOS)
+                im.save(dest_webp, "WEBP", quality=80)
+            return True
+        except Exception:
+            pass
 
     return False
 
 
+def is_scene_doc(doc: dict) -> bool:
+    if not isinstance(doc, dict):
+        return False
+    has_scene_structure = any(k in doc for k in ("walls", "lights", "tiles", "drawings", "levels"))
+    has_image = bool(extract_bg_from_raw_scene(doc) or doc.get("foreground"))
+    return (has_scene_structure or ("width" in doc and "height" in doc and "grid" in doc)) and has_image
+
+
 def extract_raw_scenes_from_source(src_dir: Path):
     """Wykrywa sceny z scenes.json lub baz NeDB (packs/*.db)."""
-    scenes = []
     scenes_json = src_dir / "scenes.json"
     if scenes_json.is_file():
         try:
             data = json.loads(scenes_json.read_text(encoding="utf-8"))
-            if isinstance(data, list):
+            if isinstance(data, list) and data:
                 return data, "scenes.json"
         except Exception as e:
             print(f"[!] Ostrzeżenie: nie udało się odczytać {scenes_json}: {e}")
 
-    db_files = list(src_dir.glob("packs/*.db")) + list(src_dir.glob("*.db"))
+    scenes = []
+    matched_dbs = []
+    db_files = sorted(set(list(src_dir.glob("packs/*.db")) + list(src_dir.glob("*.db"))))
     for db_file in db_files:
+        file_scenes = []
         try:
             for line in db_file.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 doc = json.loads(line)
-                if isinstance(doc, dict) and ("walls" in doc or "img" in doc or "background" in doc or "grid" in doc):
-                    scenes.append(doc)
+                if is_scene_doc(doc):
+                    file_scenes.append(doc)
         except Exception as e:
             print(f"[!] Ostrzeżenie podczas czytania {db_file.name}: {e}")
-        if scenes:
-            return scenes, f"baza {db_file.name}"
+        if file_scenes:
+            scenes.extend(file_scenes)
+            matched_dbs.append(db_file.name)
+
+    if scenes:
+        return scenes, f"bazy: {', '.join(matched_dbs)}"
 
     return [], None
 
@@ -228,6 +338,13 @@ def main():
         default="/srv/data/foundry-maps/modules",
         help="Katalog docelowy modułów (domyślnie: /srv/data/foundry-maps/modules).",
     )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=min(8, os.cpu_count() or 4),
+        help="Liczba wątków generowania miniatur (domyślnie: min(8, liczba rdzeni)).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż co zostanie zrobione, bez zapisu na dysk.")
     parser.add_argument("--non-interactive", action="store_true", help="Nie pytaj w konsoli, użyj wartości domyślnych.")
     args = parser.parse_args()
@@ -239,13 +356,12 @@ def main():
         print(f"[BŁĄD] Folder wejściowy nie istnieje: {src_dir}")
         sys.exit(1)
 
-    # Odczyt module.json jeśli istnieje
     mod_manifest = {}
     manifest_path = src_dir / "module.json"
     if manifest_path.is_file():
         try:
             mod_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            print(f"[INFO] Wykryto plik module.json w katalogu wejściowym.")
+            print("[INFO] Wykryto plik module.json w katalogu wejściowym.")
         except Exception as e:
             print(f"[!] Nie udało się sparsować module.json: {e}")
 
@@ -270,7 +386,6 @@ def main():
 
     dest_dir = (out_root / module_id).resolve()
 
-    # Zabezpieczenie oryginału
     if dest_dir == src_dir or src_dir in dest_dir.parents:
         print(f"[BŁĄD] Ścieżka docelowa ({dest_dir}) pokrywa się z oryginałem ({src_dir})! Przerywam.")
         sys.exit(1)
@@ -287,12 +402,11 @@ def main():
 
     raw_scenes, source_type = extract_raw_scenes_from_source(src_dir)
 
-    # Szukanie wszystkich plików graficznych w folderze źródłowym (poza _thumbs)
     all_images = sorted(
         [p for p in src_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "_thumbs" not in p.parts]
     )
 
-    print(f"\n=== Podsumowanie analizy wejścia ===")
+    print("\n=== Podsumowanie analizy wejścia ===")
     print(f" * Źródło:          {src_dir}")
     print(f" * Cel (kopia):     {dest_dir}")
     print(f" * ID modułu:       {module_id}")
@@ -302,12 +416,12 @@ def main():
 
     if args.dry_run:
         if source_type:
+            src_index = ModuleFileIndex(src_dir)
             valid_cnt = 0
             ghost_cnt = 0
             for r in raw_scenes:
-                bg = (r.get("background") or {}).get("src") if isinstance(r.get("background"), dict) else None
-                bg = bg or r.get("img")
-                if resolve_file_in_module(src_dir, bg):
+                bg = extract_bg_from_raw_scene(r)
+                if src_index.resolve(bg):
                     valid_cnt += 1
                 else:
                     ghost_cnt += 1
@@ -320,57 +434,57 @@ def main():
         print("[DRY-RUN] Zakończono symulację. Żadne pliki nie zostały zmodyfikowane.")
         return
 
-    # Bezpieczna praca na tymczasowej kopii przed przeniesieniem na miejsce docelowe
     tmp_dir = out_root / f".tmp_{module_id}_{random_foundry_id(6)}"
     try:
         out_root.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Kopiowanie plików do tymczasowego katalogu roboczego...")
+        print("[INFO] Kopiowanie plików do tymczasowego katalogu roboczego...")
         shutil.copytree(src_dir, tmp_dir)
 
         thumbs_dir = tmp_dir / "_thumbs"
         thumbs_dir.mkdir(exist_ok=True)
 
+        file_index = ModuleFileIndex(tmp_dir)
         normalized_scenes = []
+        thumb_tasks = []
         skipped_scenes = 0
 
         if source_type:
             # Wariant 1: Normalizacja istniejącego modułu Foundry
             for raw in raw_scenes:
-                scene_id = raw.get("_id") or random_foundry_id()
                 scene_name = raw.get("name") or "Scena"
-                bg_raw = (raw.get("background") or {}).get("src") if isinstance(raw.get("background"), dict) else None
-                bg_raw = bg_raw or raw.get("img")
+                bg_raw = extract_bg_from_raw_scene(raw)
 
-                resolved_file = resolve_file_in_module(tmp_dir, bg_raw)
+                resolved_file = file_index.resolve(bg_raw)
                 if not resolved_file:
                     skipped_scenes += 1
                     print(f" [POMINIĘTO] Brak pliku graficznego na dysku dla sceny '{scene_name}' ({bg_raw})")
                     continue
 
                 rel_file = resolved_file.relative_to(tmp_dir).as_posix()
+                scene_id = raw.get("_id") or deterministic_foundry_id(f"{module_id}:{rel_file}")
                 canonical_bg = f"modules/{module_id}/{rel_file}"
 
-                thumb_name = f"{resolved_file.stem}.webp"
+                thumb_name = build_thumb_filename(rel_file, resolved_file.stem)
                 thumb_file = thumbs_dir / thumb_name
-                if generate_webp_thumbnail(resolved_file, thumb_file):
-                    canonical_thumb = f"modules/{module_id}/_thumbs/{thumb_name}"
-                else:
-                    canonical_thumb = canonical_bg
+                canonical_thumb = f"modules/{module_id}/_thumbs/{thumb_name}"
 
                 w = raw.get("width")
                 h = raw.get("height")
                 if not w or not h:
                     w, h = get_image_dimensions(resolved_file)
 
+                normalize_subasset_paths(raw, file_index, module_id)
+
                 raw["_id"] = scene_id
                 raw["width"] = int(w)
                 raw["height"] = int(h)
                 raw["background"] = {"src": canonical_bg}
-                raw["thumb"] = canonical_thumb
+                raw["thumb"] = canonical_bg
                 if "img" in raw:
                     del raw["img"]
 
                 normalized_scenes.append(raw)
+                thumb_tasks.append((raw, resolved_file, thumb_file, canonical_thumb, canonical_bg))
         else:
             # Wariant 2: Generowanie scen z surowego folderu z grafikami
             if not all_images:
@@ -383,36 +497,42 @@ def main():
                 canonical_bg = f"modules/{module_id}/{rel_file}"
                 w, h = get_image_dimensions(img_src)
 
-                thumb_name = f"{img_src.stem}.webp"
+                thumb_name = build_thumb_filename(rel_file, img_src.stem)
                 thumb_file = thumbs_dir / thumb_name
-                if generate_webp_thumbnail(img_src, thumb_file):
-                    canonical_thumb = f"modules/{module_id}/_thumbs/{thumb_name}"
-                else:
-                    canonical_thumb = canonical_bg
+                canonical_thumb = f"modules/{module_id}/_thumbs/{thumb_name}"
 
                 clean_scene_name = img_src.stem.replace("_", " ").replace("-", " ").strip()
-                normalized_scenes.append({
-                    "_id": random_foundry_id(),
+                scene_doc = {
+                    "_id": deterministic_foundry_id(f"{module_id}:{rel_file}"),
                     "name": clean_scene_name,
                     "width": int(w),
                     "height": int(h),
                     "grid": {"size": 100, "type": 1, "distance": 5, "units": "ft"},
                     "background": {"src": canonical_bg},
-                    "thumb": canonical_thumb,
+                    "thumb": canonical_bg,
                     "walls": [],
                     "lights": [],
                     "tiles": []
-                })
+                }
+                normalized_scenes.append(scene_doc)
+                thumb_tasks.append((scene_doc, img_src, thumb_file, canonical_thumb, canonical_bg))
 
         if not normalized_scenes:
             raise RuntimeError("Po weryfikacji nie została ani jedna poprawna scena do zapisania.")
 
-        # Zapis zwalidowanego pliku scenes.json
+        print(f"[INFO] Generowanie miniatur ({len(thumb_tasks)} szt., wątki: {max(1, args.workers)})...")
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = [
+                (scene_doc, canonical_thumb, canonical_bg, pool.submit(generate_webp_thumbnail, src_img, t_file))
+                for scene_doc, src_img, t_file, canonical_thumb, canonical_bg in thumb_tasks
+            ]
+            for scene_doc, canonical_thumb, canonical_bg, fut in futures:
+                scene_doc["thumb"] = canonical_thumb if fut.result() else canonical_bg
+
         scenes_json_text = json.dumps(normalized_scenes, ensure_ascii=False, indent=2)
-        json.loads(scenes_json_text)  # Walidacja składni
+        json.loads(scenes_json_text)
         (tmp_dir / "scenes.json").write_text(scenes_json_text, encoding="utf-8")
 
-        # Zapis/aktualizacja module.json w kopii, aby Skrypt B znał metadane
         norm_manifest = {
             "id": module_id,
             "title": title,
@@ -421,7 +541,6 @@ def main():
         }
         (tmp_dir / "module.json").write_text(json.dumps(norm_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Atomowa podmiana katalogu docelowego
         if dest_dir.exists():
             shutil.rmtree(dest_dir)
         tmp_dir.rename(dest_dir)
