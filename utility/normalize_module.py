@@ -638,12 +638,12 @@ def main():
             sys.exit(1)
 
         zip_files = sorted(input_path.rglob("*.zip"))
-        if zip_files:
-            targets = zip_files
-            print(f"[BATCH] Znaleziono {len(targets)} archiwów .zip w: {input_path}")
-        else:
-            targets = sorted([d for d in input_path.iterdir() if d.is_dir() and not d.name.startswith(".")])
-            print(f"[BATCH] Znaleziono {len(targets)} podfolderów w: {input_path}")
+        sub_dirs = sorted([
+            d for d in input_path.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and not any(d.rglob("*.zip"))
+        ])
+        targets = zip_files + sub_dirs
+        print(f"[BATCH] Znaleziono {len(zip_files)} archiwów .zip oraz {len(sub_dirs)} podfolderów w: {input_path}")
 
         ok_cnt = 0
         fail_cnt = 0
