@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Skrypt A: Normalizacja surowego folderu z mapami lub modułu Foundry VTT.
-- Zawsze pracuje na kopii (nigdy nie modyfikuje katalogu wejściowego).
-- Obsługuje zarówno moduły Foundry (module.json, packs/*.db, scenes.json),
-  jak i surowe foldery ze zwykłymi plikami graficznymi (.jpg, .png, .webp).
+Skrypt A: Uniwersalna normalizacja modułów Foundry VTT (.zip lub folderów) oraz surowych folderów z mapami.
+- Obsługuje pojedynczy folder, pojedynczy plik .zip lub tryb wsadowy (--batch) skanujący podfoldery.
+- Obsługuje stary i nowy format Foundry (module.json, packs/*.db, scenes.json) oraz surowe obrazy.
+- Nie używa /tmp (pracuje bezpośrednio w katalogu docelowym), automatycznie odwija zagnieżdżone foldery z ZIP.
 - Generuje miniatury .webp wielowątkowo na wszystkich rdzeniach CPU.
-- Obsługuje tryb --dry-run oraz tryb interaktywny.
 """
 
 import argparse
@@ -19,6 +18,7 @@ import string
 import struct
 import subprocess
 import sys
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
@@ -31,6 +31,7 @@ except ImportError:
     HAS_PILLOW = False
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
 
 def ask_user(prompt_text: str, default_val: str = "", non_interactive: bool = False) -> str:
@@ -51,7 +52,6 @@ def random_foundry_id(length: int = 16) -> str:
 
 
 def deterministic_foundry_id(seed_str: str, length: int = 16) -> str:
-    """Generuje deterministyczne 16-znakowe ID na podstawie ścieżki, aby ponowna normalizacja zachowywała te same ID."""
     chars = string.ascii_letters + string.digits
     digest = hashlib.sha256(seed_str.encode("utf-8")).digest()
     return "".join(chars[b % len(chars)] for b in digest[:length])
@@ -62,8 +62,13 @@ def build_thumb_filename(rel_file_posix: str, stem: str) -> str:
     return f"{stem}_{rel_hash}.webp"
 
 
+def sanitize_module_id(raw_name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9-_]+", "-", raw_name.strip()).strip("-")
+    return cleaned or "custom-map-pack"
+
+
 def get_image_dimensions(file_path: Path):
-    """Odczytuje wymiary (width, height) z nagłówków PNG, JPEG i WEBP bez zewnętrznych bibliotek."""
+    """Odczytuje wymiary (width, height) z nagłówków PNG, JPEG i WEBP."""
     try:
         with file_path.open("rb") as f:
             head = f.read(32)
@@ -145,7 +150,7 @@ class ModuleFileIndex:
     def resolve(self, raw_path: str) -> Path | None:
         if not raw_path or not isinstance(raw_path, str):
             return None
-        clean = raw_path.strip().lstrip("/")
+        clean = raw_path.strip().replace("\\", "/").lstrip("/")
         if clean.startswith(("http://", "https://", "data:", "icons/", "ui/")):
             return None
         try:
@@ -160,17 +165,14 @@ class ModuleFileIndex:
         if not parts:
             return None
 
-        # 1. Dokładna ścieżka
         candidate = self.module_dir.joinpath(*parts)
         if candidate.is_file():
             return candidate
 
-        # 2. Ścieżka względna bez względu na wielkość liter
         rel_key = "/".join(parts).lower()
         if rel_key in self.by_rel_lower:
             return self.by_rel_lower[rel_key]
 
-        # 3. Dopasowanie po samej nazwie pliku
         return self.by_filename_lower.get(parts[-1].lower())
 
 
@@ -195,7 +197,6 @@ def extract_bg_from_raw_scene(raw: dict) -> str | None:
 
 
 def normalize_subasset_paths(raw: dict, file_index: ModuleFileIndex, module_id: str):
-    """Normalizuje wielkość liter i prefiks modules/<id>/ dla kafelków, tokenów, dźwięków i poziomów."""
     def to_canonical(path_str: str) -> str:
         resolved = file_index.resolve(path_str)
         if resolved:
@@ -235,7 +236,6 @@ def normalize_subasset_paths(raw: dict, file_index: ModuleFileIndex, module_id: 
 
 
 def generate_webp_thumbnail(src_image: Path, dest_webp: Path) -> bool:
-    """Generuje miniaturkę .webp używając cwebp, ffmpeg lub Pillow (jeśli dostępne)."""
     dest_webp.parent.mkdir(parents=True, exist_ok=True)
     if dest_webp.is_file() and dest_webp.stat().st_size > 0:
         return True
@@ -301,7 +301,7 @@ def extract_raw_scenes_from_source(src_dir: Path):
 
     scenes = []
     matched_dbs = []
-    db_files = sorted(set(list(src_dir.glob("packs/*.db")) + list(src_dir.glob("*.db"))))
+    db_files = sorted(set(list(src_dir.glob("packs/*.db")) + list(src_dir.glob("*.db")) + list(src_dir.rglob("packs/*.db"))))
     for db_file in db_files:
         file_scenes = []
         try:
@@ -324,121 +324,149 @@ def extract_raw_scenes_from_source(src_dir: Path):
     return [], None
 
 
-def sanitize_module_id(raw_name: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9-_]+", "-", raw_name.strip()).strip("-")
-    return cleaned or "custom-map-pack"
+def peek_zip_manifest(zip_path: Path) -> dict:
+    """Odczytuje module.json z wnętrza pliku ZIP bez rozpakowywania całego archiwum."""
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            candidates = [
+                m for m in zf.namelist()
+                if m.replace("\\", "/").split("/")[-1].lower() == "module.json"
+                and "__MACOSX" not in m
+            ]
+            candidates.sort(key=lambda x: len(x.replace("\\", "/").split("/")))
+            if candidates:
+                raw_bytes = zf.read(candidates[0])
+                return json.loads(raw_bytes.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+    return {}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Skrypt A: Normalizacja modułu map (praca na kopii).")
-    parser.add_argument("--input", "-i", required=True, help="Ścieżka do surowego folderu wejściowego.")
-    parser.add_argument(
-        "--output-root",
-        "-o",
-        default="/srv/data/foundry-maps/modules",
-        help="Katalog docelowy modułów (domyślnie: /srv/data/foundry-maps/modules).",
+def extract_zip_cleanly(zip_path: Path, target_dir: Path):
+    """Rozpakowuje archiwum ZIP bezpośrednio do target_dir i odwija pojedynczy zagnieżdżony folder główny."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            clean_name = member.filename.replace("\\", "/").lstrip("/")
+            if not clean_name or "__MACOSX" in clean_name:
+                continue
+            parts = Path(clean_name).parts
+            if not parts or any(p in ("..", ".") for p in parts):
+                continue
+            if parts[-1].lower() in JUNK_NAMES:
+                continue
+
+            dest_path = target_dir.joinpath(*parts)
+            if member.is_dir() or member.filename.endswith(("/", "\\")):
+                dest_path.mkdir(parents=True, exist_ok=True)
+            else:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src_f, dest_path.open("wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+
+    # Jeśli module.json znajduje się w podfolderze (np. zip/nazwa-modulu/module.json), przenieś jego zawartość wyżej
+    mod_jsons = sorted(
+        list(target_dir.rglob("module.json")),
+        key=lambda p: len(p.relative_to(target_dir).parts)
     )
-    parser.add_argument(
-        "--workers",
-        "-w",
-        type=int,
-        default=min(8, os.cpu_count() or 4),
-        help="Liczba wątków generowania miniatur (domyślnie: min(8, liczba rdzeni)).",
+    if mod_jsons and mod_jsons[0].parent != target_dir:
+        inner_root = mod_jsons[0].parent
+        unwrap_tmp = target_dir.parent / f".unwrap_{random_foundry_id(6)}"
+        inner_root.rename(unwrap_tmp)
+        shutil.rmtree(target_dir)
+        unwrap_tmp.rename(target_dir)
+
+
+def find_effective_source_dir(src_dir: Path) -> Path:
+    """Jeśli w katalogu wejściowym module.json jest o poziom niżej, zwróć właściwy podfolder."""
+    if (src_dir / "module.json").is_file() or (src_dir / "scenes.json").is_file():
+        return src_dir
+    mod_jsons = sorted(
+        [p for p in src_dir.rglob("module.json") if len(p.relative_to(src_dir).parts) <= 3],
+        key=lambda p: len(p.relative_to(src_dir).parts)
     )
-    parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż co zostanie zrobione, bez zapisu na dysk.")
-    parser.add_argument("--non-interactive", action="store_true", help="Nie pytaj w konsoli, użyj wartości domyślnych.")
-    args = parser.parse_args()
+    if mod_jsons:
+        return mod_jsons[0].parent
+    return src_dir
 
-    src_dir = Path(args.input).resolve()
-    out_root = Path(args.output_root).resolve()
 
-    if not src_dir.is_dir():
-        print(f"[BŁĄD] Folder wejściowy nie istnieje: {src_dir}")
-        sys.exit(1)
+def process_single_item(input_path: Path, out_root: Path, args) -> bool:
+    is_zip = input_path.is_file() and input_path.suffix.lower() == ".zip"
 
-    mod_manifest = {}
-    manifest_path = src_dir / "module.json"
-    if manifest_path.is_file():
-        try:
-            mod_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            print("[INFO] Wykryto plik module.json w katalogu wejściowym.")
-        except Exception as e:
-            print(f"[!] Nie udało się sparsować module.json: {e}")
+    if is_zip:
+        mod_manifest = peek_zip_manifest(input_path)
+        fallback_stem = input_path.stem
+    else:
+        effective_src = find_effective_source_dir(input_path)
+        manifest_path = effective_src / "module.json"
+        mod_manifest = {}
+        if manifest_path.is_file():
+            try:
+                mod_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"[!] Nie udało się sparsować module.json w {effective_src}: {e}")
+        fallback_stem = effective_src.name
 
-    default_mod_id = mod_manifest.get("id") or mod_manifest.get("name") or sanitize_module_id(src_dir.name)
-    default_title = mod_manifest.get("title") or src_dir.name.replace("-", " ").replace("_", " ").title()
+    default_mod_id = sanitize_module_id(str(mod_manifest.get("id") or mod_manifest.get("name") or fallback_stem))
+    default_title = str(mod_manifest.get("title") or fallback_stem.replace("-", " ").replace("_", " ").title())
     default_version = str(mod_manifest.get("version") or "1.0.0")
     default_cat = "scene" if "scene" in default_mod_id.lower() or "scene" in default_title.lower() else "map"
 
+    non_interactive = args.non_interactive or args.batch
+
     if not mod_manifest.get("id") and not mod_manifest.get("name"):
-        module_id = ask_user("Podaj identyfikator modułu (moduleId)", default_mod_id, args.non_interactive)
+        module_id = sanitize_module_id(ask_user("Podaj identyfikator modułu (moduleId)", default_mod_id, non_interactive))
     else:
         module_id = default_mod_id
 
     if not mod_manifest.get("title"):
-        title = ask_user("Podaj tytuł paczki (title)", default_title, args.non_interactive)
+        title = ask_user("Podaj tytuł paczki (title)", default_title, non_interactive)
     else:
         title = default_title
 
-    category = ask_user("Podaj kategorię paczki ('map' lub 'scene')", default_cat, args.non_interactive).lower()
+    category = ask_user("Podaj kategorię paczki ('map' lub 'scene')", default_cat, non_interactive).lower()
     if category not in ("map", "scene"):
         category = "map"
 
     dest_dir = (out_root / module_id).resolve()
 
-    if dest_dir == src_dir or src_dir in dest_dir.parents:
-        print(f"[BŁĄD] Ścieżka docelowa ({dest_dir}) pokrywa się z oryginałem ({src_dir})! Przerywam.")
-        sys.exit(1)
+    if not is_zip and (dest_dir == input_path or input_path in dest_dir.parents):
+        print(f"[BŁĄD] Ścieżka docelowa ({dest_dir}) pokrywa się z oryginałem ({input_path})! Pomijam.")
+        return False
 
     if dest_dir.exists():
-        print(f"[!] Katalog docelowy już istnieje: {dest_dir}")
+        if args.skip_existing:
+            print(f"[POMINIĘTO] Moduł '{module_id}' już istnieje w katalogu docelowym (--skip-existing).")
+            return True
         if args.dry_run:
-            print("[DRY-RUN] Katalog docelowy zostałby nadpisany nową kopią.")
-        else:
-            ans = ask_user("Czy chcesz zastąpić istniejącą kopię w katalogu docelowym? (t/n)", "n", args.non_interactive)
+            print(f"[DRY-RUN] Moduł '{module_id}' ({dest_dir}) zostałby zastąpiony.")
+            return True
+        if not args.overwrite:
+            ans = ask_user(f"Katalog {dest_dir.name} już istnieje. Zastąpić? (t/n)", "n", non_interactive)
             if ans.lower() not in ("t", "tak", "y", "yes"):
-                print("[INFO] Pominięto – istniejący katalog nie został zmodyfikowany.")
-                sys.exit(0)
-
-    raw_scenes, source_type = extract_raw_scenes_from_source(src_dir)
-
-    all_images = sorted(
-        [p for p in src_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "_thumbs" not in p.parts]
-    )
-
-    print("\n=== Podsumowanie analizy wejścia ===")
-    print(f" * Źródło:          {src_dir}")
-    print(f" * Cel (kopia):     {dest_dir}")
-    print(f" * ID modułu:       {module_id}")
-    print(f" * Tytuł:           {title} (v{default_version}, kategoria: {category})")
-    print(f" * Tryb wejścia:    {'Moduł Foundry (' + source_type + ')' if source_type else 'Surowy folder z obrazami'}")
-    print(f" * Pliki graficzne: {len(all_images)} szt.")
+                print(f"[POMINIĘTO] Istniejący katalog '{module_id}' nie został zmodyfikowany.")
+                return True
 
     if args.dry_run:
-        if source_type:
-            src_index = ModuleFileIndex(src_dir)
-            valid_cnt = 0
-            ghost_cnt = 0
-            for r in raw_scenes:
-                bg = extract_bg_from_raw_scene(r)
-                if src_index.resolve(bg):
-                    valid_cnt += 1
-                else:
-                    ghost_cnt += 1
-                    print(f"   [DRY-RUN] Pominięto martwą scenę (brak pliku tła): {r.get('name')} -> {bg}")
-            print(f"[DRY-RUN] Zostanie zapisanych {valid_cnt} poprawnych scen (odrzucono {ghost_cnt} martwych wpisów).")
-        else:
-            for img in all_images:
-                w, h = get_image_dimensions(img)
-                print(f"   [DRY-RUN] Utworzono by scenę z obrazu: {img.relative_to(src_dir)} ({w}x{h})")
-        print("[DRY-RUN] Zakończono symulację. Żadne pliki nie zostały zmodyfikowane.")
-        return
+        print(f"[DRY-RUN] Przetworzono by: {input_path.name} -> {dest_dir} (tytuł: '{title}', v{default_version})")
+        return True
 
+    out_root.mkdir(parents=True, exist_ok=True)
     tmp_dir = out_root / f".tmp_{module_id}_{random_foundry_id(6)}"
+
     try:
-        out_root.mkdir(parents=True, exist_ok=True)
-        print("[INFO] Kopiowanie plików do tymczasowego katalogu roboczego...")
-        shutil.copytree(src_dir, tmp_dir)
+        if is_zip:
+            print(f"[INFO] Rozpakowywanie archiwum '{input_path.name}' -> '{module_id}'...")
+            extract_zip_cleanly(input_path, tmp_dir)
+        else:
+            effective_src = find_effective_source_dir(input_path)
+            print(f"[INFO] Kopiowanie folderu '{effective_src.name}' -> '{module_id}'...")
+            shutil.copytree(effective_src, tmp_dir)
+
+        raw_scenes, source_type = extract_raw_scenes_from_source(tmp_dir)
+        all_images = sorted(
+            [p for p in tmp_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "_thumbs" not in p.parts]
+        )
 
         thumbs_dir = tmp_dir / "_thumbs"
         thumbs_dir.mkdir(exist_ok=True)
@@ -449,7 +477,6 @@ def main():
         skipped_scenes = 0
 
         if source_type:
-            # Wariant 1: Normalizacja istniejącego modułu Foundry
             for raw in raw_scenes:
                 scene_name = raw.get("name") or "Scena"
                 bg_raw = extract_bg_from_raw_scene(raw)
@@ -457,7 +484,7 @@ def main():
                 resolved_file = file_index.resolve(bg_raw)
                 if not resolved_file:
                     skipped_scenes += 1
-                    print(f" [POMINIĘTO] Brak pliku graficznego na dysku dla sceny '{scene_name}' ({bg_raw})")
+                    print(f" [POMINIĘTO SCENĘ] Brak pliku na dysku dla '{scene_name}' ({bg_raw})")
                     continue
 
                 rel_file = resolved_file.relative_to(tmp_dir).as_posix()
@@ -486,13 +513,10 @@ def main():
                 normalized_scenes.append(raw)
                 thumb_tasks.append((raw, resolved_file, thumb_file, canonical_thumb, canonical_bg))
         else:
-            # Wariant 2: Generowanie scen z surowego folderu z grafikami
             if not all_images:
-                raise RuntimeError("W podanym folderze nie znaleziono żadnych plików graficznych (.jpg/.png/.webp).")
+                raise RuntimeError("Nie znaleziono żadnych plików graficznych (.jpg/.png/.webp).")
 
-            for img_src in sorted(
-                [p for p in tmp_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "_thumbs" not in p.parts]
-            ):
+            for img_src in all_images:
                 rel_file = img_src.relative_to(tmp_dir).as_posix()
                 canonical_bg = f"modules/{module_id}/{rel_file}"
                 w, h = get_image_dimensions(img_src)
@@ -520,7 +544,6 @@ def main():
         if not normalized_scenes:
             raise RuntimeError("Po weryfikacji nie została ani jedna poprawna scena do zapisania.")
 
-        print(f"[INFO] Generowanie miniatur ({len(thumb_tasks)} szt., wątki: {max(1, args.workers)})...")
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
             futures = [
                 (scene_doc, canonical_thumb, canonical_bg, pool.submit(generate_webp_thumbnail, src_img, t_file))
@@ -545,14 +568,100 @@ def main():
             shutil.rmtree(dest_dir)
         tmp_dir.rename(dest_dir)
 
-        print(f"[SUKCES] Znormalizowano moduł do: {dest_dir}")
-        print(f"         Dodano scen: {len(normalized_scenes)} | Pominięto uszkodzonych: {skipped_scenes}")
+        print(f"[SUKCES] {module_id} ('{title}') -> scen: {len(normalized_scenes)} | pominięto: {skipped_scenes}")
+
+        if is_zip and args.delete_source_zip and (dest_dir / "scenes.json").is_file():
+            input_path.unlink(missing_ok=True)
+            print(f"[CLEANUP] Usunięto źródłowy plik ZIP: {input_path.name}")
+
+        return True
 
     except Exception as e:
-        print(f"[BŁĄD KRYTYCZNY] Operacja przerwana: {e}")
+        print(f"[BŁĄD] Nie udało się przetworzyć '{input_path.name}': {e}")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Skrypt A: Uniwersalna normalizacja modułów map (.zip lub folderów).")
+    parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Ścieżka do pliku .zip, folderu modułu lub katalogu nadrzędnego (w trybie --batch).",
+    )
+    parser.add_argument(
+        "--output-root", "-o",
+        default="/srv/data/foundry-maps/modules",
+        help="Katalog docelowy modułów (domyślnie: /srv/data/foundry-maps/modules).",
+    )
+    parser.add_argument(
+        "--batch", "-b",
+        action="store_true",
+        help="Tryb wsadowy: znajdź i przetwórz wszystkie pliki .zip (lub podfoldery) wewnątrz --input.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Pomiń moduły, które już istnieją w katalogu docelowym.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Nadpisz istniejące moduły w katalogu docelowym bez pytania.",
+    )
+    parser.add_argument(
+        "--delete-source-zip",
+        action="store_true",
+        help="Po pomyślnej normalizacji usuń źródłowy plik .zip, aby oszczędzać miejsce na dysku.",
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=min(8, os.cpu_count() or 4),
+        help="Liczba wątków generowania miniatur.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż co zostanie zrobione, bez zapisu na dysk.")
+    parser.add_argument("--non-interactive", action="store_true", help="Nie pytaj w konsoli, użyj wartości domyślnych.")
+    args = parser.parse_args()
+
+    input_path = Path(args.input).resolve()
+    out_root = Path(args.output_root).resolve()
+
+    if not input_path.exists():
+        print(f"[BŁĄD] Ścieżka wejściowa nie istnieje: {input_path}")
         sys.exit(1)
+
+    if args.batch:
+        if not input_path.is_dir():
+            print(f"[BŁĄD] W trybie --batch ścieżka --input musi być katalogiem: {input_path}")
+            sys.exit(1)
+
+        zip_files = sorted(input_path.rglob("*.zip"))
+        if zip_files:
+            targets = zip_files
+            print(f"[BATCH] Znaleziono {len(targets)} archiwów .zip w: {input_path}")
+        else:
+            targets = sorted([d for d in input_path.iterdir() if d.is_dir() and not d.name.startswith(".")])
+            print(f"[BATCH] Znaleziono {len(targets)} podfolderów w: {input_path}")
+
+        ok_cnt = 0
+        fail_cnt = 0
+        for idx, target in enumerate(targets, 1):
+            print(f"\n--- [{idx} / {len(targets)}] {target.name} ---")
+            if process_single_item(target, out_root, args):
+                ok_cnt += 1
+            else:
+                fail_cnt += 1
+
+        print(f"\n=== Podsumowanie wsadowe (Batch) ===")
+        print(f" * Przetworzono pomyślnie: {ok_cnt}")
+        print(f" * Błędy / pominięte:      {fail_cnt}")
+        if fail_cnt > 0:
+            sys.exit(1)
+    else:
+        if not process_single_item(input_path, out_root, args):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
