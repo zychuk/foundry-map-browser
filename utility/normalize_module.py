@@ -163,8 +163,13 @@ def convert_image_to_webp(src_path: Path, quality: int = 90) -> Path:
     Konwertuje plik .avif lub .png (lub .jpg) do .webp w jakości 90.
     Jeśli konwersja się powiedzie, usuwa oryginał i zwraca nową ścieżkę .webp.
     """
-    if not src_path.is_file():
+    try:
+        if not src_path.is_file():
+            return src_path
+        orig_size = src_path.stat().st_size
+    except OSError:
         return src_path
+
     dest_webp = src_path.with_suffix(".webp")
     if dest_webp == src_path:
         return src_path
@@ -173,50 +178,55 @@ def convert_image_to_webp(src_path: Path, quality: int = 90) -> Path:
     ext = src_path.suffix.lower()
     converted = False
 
-    if ext != ".avif" and shutil.which("cwebp"):
-        res = subprocess.run(
-            ["cwebp", "-quiet", "-q", str(quality), "-mt", str(src_path), "-o", str(tmp_webp)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
-            converted = True
-
-    if not converted and HAS_PILLOW:
-        try:
-            with Image.open(src_path) as im:
-                im = ImageOps.exif_transpose(im)
-                if im.mode not in ("RGB", "RGBA"):
-                    im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-                im.save(tmp_webp, "WEBP", quality=quality, method=4)
-            if tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+    try:
+        if ext != ".avif" and shutil.which("cwebp"):
+            res = subprocess.run(
+                ["cwebp", "-quiet", "-q", str(quality), "-mt", str(src_path), "-o", str(tmp_webp)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
                 converted = True
-        except Exception:
-            pass
 
-    if not converted and shutil.which("ffmpeg"):
-        res = subprocess.run(
-            [
-                "ffmpeg", "-y", "-v", "error",
-                "-i", str(src_path),
-                "-frames:v", "1",
-                "-c:v", "libwebp",
-                "-q:v", str(quality),
-                str(tmp_webp),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
-            converted = True
+        if not converted and HAS_PILLOW:
+            try:
+                with Image.open(src_path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    if im.mode not in ("RGB", "RGBA"):
+                        im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+                    im.save(tmp_webp, "WEBP", quality=quality, method=4)
+                if tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+                    converted = True
+            except Exception:
+                pass
 
-    if converted and tmp_webp.is_file():
-        if ext == ".avif" or tmp_webp.stat().st_size < src_path.stat().st_size:
-            src_path.unlink(missing_ok=True)
-            tmp_webp.rename(dest_webp)
-            return dest_webp
+        if not converted and shutil.which("ffmpeg"):
+            res = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-i", str(src_path),
+                    "-frames:v", "1",
+                    "-c:v", "libwebp",
+                    "-q:v", str(quality),
+                    str(tmp_webp),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+                converted = True
 
-    tmp_webp.unlink(missing_ok=True)
+        if converted and tmp_webp.is_file():
+            new_size = tmp_webp.stat().st_size
+            if new_size > 0 and (ext == ".avif" or new_size < orig_size):
+                src_path.unlink(missing_ok=True)
+                tmp_webp.rename(dest_webp)
+                return dest_webp
+    except OSError:
+        pass
+    finally:
+        tmp_webp.unlink(missing_ok=True)
+
     return src_path
 
 
@@ -546,7 +556,6 @@ def extract_raw_scenes_from_source(src_dir: Path):
         except Exception as e:
             print(f"[!] Ostrzeżenie: nie udało się odczytać {scenes_json}: {e}")
 
-    # 1. Sprawdź bazy NeDB (*.db)
     scenes = []
     matched_dbs = []
     db_files = sorted(set(list(src_dir.glob("packs/*.db")) + list(src_dir.glob("*.db")) + list(src_dir.rglob("packs/*.db"))))
@@ -569,7 +578,6 @@ def extract_raw_scenes_from_source(src_dir: Path):
     if scenes:
         return scenes, f"NeDB: {', '.join(matched_dbs)}"
 
-    # 2. Sprawdź katalogi LevelDB (Foundry v11+)
     ldb_dirs = sorted({
         p.parent for p in src_dir.rglob("CURRENT")
         if (p.parent / "MANIFEST-000001").exists() or list(p.parent.glob("*.ldb")) or list(p.parent.glob("*.log"))
@@ -841,7 +849,6 @@ def process_single_item(input_path: Path, out_root: Path, args) -> bool:
         if source_type:
             print(f"[INFO] Wykryto źródło scen: {source_type} ({len(raw_scenes)} scen)")
 
-        # Konwersja plików .avif i .png (oraz opcjonalnie .jpg) do .webp w jakości args.quality (domyślnie 90)
         if not args.no_webp_convert:
             to_convert = [
                 p for p in tmp_dir.rglob("*")
