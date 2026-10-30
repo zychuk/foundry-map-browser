@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAS_PILLOW = False
 
-MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm"}
+MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".mp4", ".webm"}
 VIDEO_EXTS = {".mp4", ".webm"}
 
 
@@ -59,7 +59,8 @@ def make_thumb(src: Path, dest: Path, dry_run: bool = False) -> str:
                 combined.save(dest, "WEBP", quality=80)
                 return "created"
         except Exception as e:
-            print(f"[!] Błąd Pillow dla {src.name}: {e}", file=sys.stderr)
+            if ext != ".avif":
+                print(f"[!] Błąd Pillow dla {src.name}: {e}", file=sys.stderr)
 
     # 2. Fallback: ffmpeg (z zachowaniem proporcji obrazu i białym tłem pod przezroczystością)
     if shutil.which("ffmpeg"):
@@ -81,7 +82,7 @@ def make_thumb(src: Path, dest: Path, dry_run: bool = False) -> str:
             return "created"
 
     # 3. Fallback: cwebp
-    if ext not in VIDEO_EXTS and ext != ".gif" and shutil.which("cwebp"):
+    if ext not in VIDEO_EXTS and ext not in (".gif", ".avif") and shutil.which("cwebp"):
         res = subprocess.run(
             ["cwebp", "-quiet", "-resize", "480", "0", "-q", "80", str(src), "-o", str(dest)],
             stdout=subprocess.DEVNULL,

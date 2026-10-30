@@ -18,7 +18,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png"}
+IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".avif"}
 
 
 def ask_user(prompt_text: str, default_val: str = "", non_interactive: bool = False) -> str:
@@ -50,11 +50,6 @@ def extract_bg_from_scene(r: dict) -> str | None:
 
 
 def find_first_thumbnail_in_module(root_dir: Path, module_dir: Path, scenes_list: list) -> str:
-    """
-    Domyślne zachowanie dla katalogów:
-    1. Szuka pierwszego fizycznie istniejącego pliku graficznego w folderze _thumbs/ danego modułu.
-    2. Jeśli brak _thumbs/, bierze pierwszą istniejącą miniaturę/tło ze scen.
-    """
     thumbs_dir = module_dir / "_thumbs"
     if thumbs_dir.is_dir():
         files = sorted([p for p in thumbs_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS])

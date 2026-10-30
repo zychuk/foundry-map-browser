@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Skrypt przygotowujący paczki z Sage2025 / Sage2026 do jednego folderu pod normalize_module.py:
+Skrypt przygotowujący paczki map pod normalize_module.py:
 1. Dla paczek z plikiem manifestu Foundry VTT (Ready-to-play / manifest url.txt / Manifeft URL.txt):
    pobiera moduł(y) .zip do katalogu wyjściowego, weryfikuje archiwum ZIP i usuwa cały oryginalny folder paczki.
 2. Dla paczek bez manifestu Foundry VTT:
@@ -19,9 +19,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 
-# Foldery z dodatkami niebędącymi mapami/scenami (statblocki, paczki assetów Dungeondraft)
 IGNORED_SUBFOLDER_KEYWORDS = (
     "statblock",
     "stat block",
@@ -29,7 +28,6 @@ IGNORED_SUBFOLDER_KEYWORDS = (
     "dd asset",
 )
 
-# Ignorowane linki społecznościowe w plikach README
 IGNORED_DOMAINS = (
     "patreon.com/posts",
     "patreon.com/c/",
@@ -43,17 +41,13 @@ IGNORED_DOMAINS = (
     "roll20.net",
 )
 
-# Rozpoznaje oznaczenia braku siatki: NG, GL (Gridless), NoGrid, Gridless
-# Obsługuje sklejone nazwy z drzewa takie jak: "NGwebp", "NoLightingNG", "NG_B&W", "evil GL"
 NG_REGEX = re.compile(
-    r"(?:^|[\s_\-\(\[\.]|(?<=lighting))(ng|gl|no[\s_\-]?grid|gridless|ungridded)(?=[\s_\-\)\]\.]|webp|jpg|png|$)",
+    r"(?:^|[\s_\-\(\[\.]|(?<=lighting))(ng|gl|no[\s_\-]?grid|gridless|ungridded)(?=[\s_\-\)\]\.]|webp|jpg|png|avif|$)",
     re.IGNORECASE,
 )
 
-# Rozpoznaje oznaczenia siatki: GRID, Grid, Grd, GRD
-# Obsługuje sklejone nazwy z drzewa takie jak: "v2GRID", "GRIDwebp", "GRID_B&W", "Rain GRD", "Blood Grd"
 GRID_REGEX = re.compile(
-    r"(?:^|[\s_\-\(\[\.]|(?<=v\d))(grid|grd|gridded)(?=[\s_\-\)\]\.]|webp|jpg|png|$)",
+    r"(?:^|[\s_\-\(\[\.]|(?<=v\d))(grid|grd|gridded)(?=[\s_\-\)\]\.]|webp|jpg|png|avif|$)",
     re.IGNORECASE,
 )
 
@@ -89,7 +83,6 @@ def is_grid_filename(stem: str) -> bool:
 
 
 def strip_grid_ng_tokens(stem: str) -> str:
-    """Czyści tokeny NG / GL / GRID / webp-typo z nazwy pliku do porównań i czystych nazw scen."""
     s = re.sub(r"(?i)(ng|grid)webp$", r"\1", stem)
     s = NG_REGEX.sub(" ", s)
     s = GRID_REGEX.sub(" ", s)
@@ -108,7 +101,6 @@ def normalize_download_url(url: str) -> str:
 
 
 def find_manifest_urls_in_pack(pack_dir: Path) -> list[str]:
-    """Szuka wszystkich plików manifestu (w tym 'Manifeft URL.txt', 'manifest_url.txt', 'manifest.txt')."""
     candidate_files = []
     for p in sorted(pack_dir.rglob("*")):
         if not p.is_file():
@@ -146,10 +138,6 @@ def find_manifest_urls_in_pack(pack_dir: Path) -> list[str]:
 
 
 def download_foundry_zip(url: str, output_dir: Path, fallback_slug: str) -> Path | None:
-    """
-    Pobiera manifest module.json (i zawarty w nim link 'download') lub bezpośrednio plik .zip.
-    Zwraca ścieżkę do zweryfikowanego pliku .zip lub None w razie błędu.
-    """
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) FoundryMapPrep/1.0"}
     req = urllib.request.Request(url, headers=headers)
     tmp_part = output_dir / f".download_{fallback_slug}.part"
@@ -161,18 +149,14 @@ def download_foundry_zip(url: str, output_dir: Path, fallback_slug: str) -> Path
             if not first_chunk:
                 return None
 
-            # Przypadek 1: URL zwraca bezpośrednio archiwum ZIP
             if first_chunk.startswith(b"PK\x03\x04"):
                 final_zip = output_dir / f"{fallback_slug}.zip"
                 with tmp_part.open("wb") as out_f:
                     out_f.write(first_chunk)
                     shutil.copyfileobj(resp, out_f)
             else:
-                # Przypadek 2: URL zwraca plik module.json
                 raw_bytes = first_chunk + resp.read(2 * 1024 * 1024)
-                text_data = raw_bytes.decode("utf-8", errors="ignore").strip()
-                # Usuń ewentualny BOM
-                text_data = text_data.lstrip("\ufeff")
+                text_data = raw_bytes.decode("utf-8", errors="ignore").strip().lstrip("\ufeff")
                 manifest = json.loads(text_data)
 
                 dl_url = manifest.get("download")
@@ -180,7 +164,6 @@ def download_foundry_zip(url: str, output_dir: Path, fallback_slug: str) -> Path
                     print(f"    [!] Manifest nie zawiera pola 'download': {url}")
                     return None
 
-                # Jeśli adres download jest względny względem URL manifestu, rozwiąż go
                 dl_url = urllib.parse.urljoin(url, dl_url.strip())
                 dl_url = normalize_download_url(dl_url)
 
@@ -211,11 +194,6 @@ def download_foundry_zip(url: str, output_dir: Path, fallback_slug: str) -> Path
 
 
 def select_gridless_images_in_folder(images: list[Path]) -> list[Path]:
-    """
-    Dla pojedynczego podfolderu mapy wybiera tylko wersje bez siatki (NG/GL):
-    - Jeśli w podfolderze są pliki jawnie oznaczone NG/GL -> bierze tylko NG/GL (odrzuca GRID oraz nieoznaczone z siatką, np. Victorian Tech Mansion).
-    - Jeśli w podfolderze nie ma plików NG/GL, ale są pliki GRID oraz zwykłe (np. Cartography Pack 2) -> odrzuca GRID i bierze zwykłe.
-    """
     ng_files = []
     grid_files = []
     neutral_files = []
@@ -240,7 +218,6 @@ def process_pack(pack_dir: Path, output_dir: Path, dry_run: bool = False, keep_s
     pack_slug = slugify(pack_name)
     print(f"\n=== [{pack_dir.parent.name} / {pack_dir.name}] ===")
 
-    # KROK 1: Sprawdź czy paczka posiada plik(i) manifestu Foundry VTT
     manifest_urls = find_manifest_urls_in_pack(pack_dir)
     if manifest_urls:
         if dry_run:
@@ -271,14 +248,12 @@ def process_pack(pack_dir: Path, output_dir: Path, dry_run: bool = False, keep_s
         else:
             print(" [!] Nie udało się pobrać modułu z manifestu — przechodzę do ekstrakcji surowych map NG.")
 
-    # KROK 2: Paczka bez manifestu Foundry -> zbierz surowe obrazy (tylko NG / bez siatki)
     by_subfolder: dict[Path, list[Path]] = {}
     total_found = 0
 
     for p in sorted(pack_dir.rglob("*")):
         if not p.is_file():
             continue
-        # Ignoruj pliki tymczasowe z tyldą (np. .jpg~) oraz pliki .dd2vtt.png (miniaturki VTT)
         if p.name.endswith("~") or ".dd2vtt" in p.name.lower():
             continue
         if p.suffix.lower() not in IMAGE_EXTS:
@@ -346,7 +321,6 @@ def process_pack(pack_dir: Path, output_dir: Path, dry_run: bool = False, keep_s
 
 
 def discover_pack_dirs(inputs: list[str]) -> list[Path]:
-    """Wykrywa katalogi paczek wewnątrz podanych folderów (np. Sage2025/* i Sage2026/*)."""
     pack_dirs = []
     for raw_in in inputs:
         p = Path(raw_in).resolve()
@@ -360,7 +334,7 @@ def discover_pack_dirs(inputs: list[str]) -> list[Path]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Przygotowuje drzewo paczek Sage2025/Sage2026 pod normalize_module.py.")
+    parser = argparse.ArgumentParser(description="Przygotowuje drzewo paczek map pod normalize_module.py.")
     parser.add_argument(
         "--inputs", "-i",
         nargs="+",
