@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 Skrypt A: Uniwersalna normalizacja i optymalizacja modułów Foundry VTT (.zip lub folderów) oraz surowych map.
-- Obsługuje stary format NeDB (packs/*.db), nowy format LevelDB v11-v14 (packs/*/*.ldb, *.log),
-  scenes.json oraz surowe foldery z obrazami (.jpg, .png, .webp, .avif).
-- Automatycznie konwertuje pliki .avif oraz .png do .webp w jakości 90 (100% kompatybilności i oszczędność miejsca).
-- Usuwa z wynikowego modułu nieużywane pliki (bazy packs/, duplikaty z siatką, stare foldery thumbs/, PDF-y).
 """
 
 import argparse
@@ -33,6 +29,7 @@ except ImportError:
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 THUMB_DIR_NAMES = {"_thumbs", "thumbs", "thumbnails", "thumb"}
+BIG_WEBP_THRESHOLD = int(3.5 * 1024 * 1024)  # 3.5 MB
 
 
 def is_thumb_dir_part(parts: tuple[str, ...]) -> bool:
@@ -77,7 +74,6 @@ def sanitize_module_id(raw_name: str) -> str:
 
 
 def get_image_dimensions(file_path: Path):
-    """Odczytuje wymiary (width, height) z nagłówków PNG/JPEG/WEBP, Pillow lub ffprobe (dla AVIF)."""
     try:
         with file_path.open("rb") as f:
             head = f.read(32)
@@ -158,10 +154,55 @@ def get_image_dimensions(file_path: Path):
     return 4000, 3000
 
 
-def convert_image_to_webp(src_path: Path, quality: int = 90) -> Path:
+def _encode_to_temp_webp(src_path: Path, tmp_webp: Path, quality: int) -> bool:
+    ext = src_path.suffix.lower()
+    tmp_webp.unlink(missing_ok=True)
+
+    if ext != ".avif" and shutil.which("cwebp"):
+        res = subprocess.run(
+            ["cwebp", "-quiet", "-q", str(quality), "-mt", str(src_path), "-o", str(tmp_webp)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+            return True
+
+    if HAS_PILLOW:
+        try:
+            with Image.open(src_path) as im:
+                im = ImageOps.exif_transpose(im)
+                if im.mode not in ("RGB", "RGBA"):
+                    im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+                im.save(tmp_webp, "WEBP", quality=quality, method=4)
+            if tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+                return True
+        except Exception:
+            pass
+
+    if shutil.which("ffmpeg"):
+        res = subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(src_path),
+                "-frames:v", "1",
+                "-c:v", "libwebp",
+                "-q:v", str(quality),
+                str(tmp_webp),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
+            return True
+
+    return False
+
+
+def convert_image_to_webp(src_path: Path, quality: int = 85) -> Path:
     """
-    Konwertuje plik .avif lub .png (lub .jpg) do .webp w jakości 90.
-    Jeśli konwersja się powiedzie, usuwa oryginał i zwraca nową ścieżkę .webp.
+    Konwertuje plik .avif, .png, .jpg lub odchudza duży plik .webp (>3.5 MB) do .webp.
+    Dla plików .jpg, jeśli przy zadanej jakości plik wyszedłby większy od oryginału,
+    automatycznie próbuje z niższą jakością (75), aby przejść na .webp i zmniejszyć rozmiar.
     """
     try:
         if not src_path.is_file():
@@ -171,57 +212,39 @@ def convert_image_to_webp(src_path: Path, quality: int = 90) -> Path:
         return src_path
 
     dest_webp = src_path.with_suffix(".webp")
-    if dest_webp == src_path:
-        return src_path
-
     tmp_webp = src_path.with_name(f".conv_{src_path.stem}_{random_foundry_id(4)}.webp")
     ext = src_path.suffix.lower()
-    converted = False
 
     try:
-        if ext != ".avif" and shutil.which("cwebp"):
-            res = subprocess.run(
-                ["cwebp", "-quiet", "-q", str(quality), "-mt", str(src_path), "-o", str(tmp_webp)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
-                converted = True
+        qualities_to_try = [quality]
+        if ext in (".jpg", ".jpeg") and quality > 75:
+            qualities_to_try.append(75)
 
-        if not converted and HAS_PILLOW:
-            try:
-                with Image.open(src_path) as im:
-                    im = ImageOps.exif_transpose(im)
-                    if im.mode not in ("RGB", "RGBA"):
-                        im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
-                    im.save(tmp_webp, "WEBP", quality=quality, method=4)
-                if tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
-                    converted = True
-            except Exception:
-                pass
+        for q in qualities_to_try:
+            if not _encode_to_temp_webp(src_path, tmp_webp, q):
+                continue
+            if not tmp_webp.is_file():
+                continue
 
-        if not converted and shutil.which("ffmpeg"):
-            res = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-v", "error",
-                    "-i", str(src_path),
-                    "-frames:v", "1",
-                    "-c:v", "libwebp",
-                    "-q:v", str(quality),
-                    str(tmp_webp),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if res.returncode == 0 and tmp_webp.is_file() and tmp_webp.stat().st_size > 0:
-                converted = True
-
-        if converted and tmp_webp.is_file():
             new_size = tmp_webp.stat().st_size
-            if new_size > 0 and (ext == ".avif" or new_size < orig_size):
+            if new_size <= 0:
+                continue
+
+            if ext == ".webp":
+                # Dla .webp podmień tylko jeśli zyskujemy min. 15% rozmiaru
+                if new_size < orig_size * 0.85:
+                    tmp_webp.replace(dest_webp)
+                    return dest_webp
+            elif ext == ".avif":
                 src_path.unlink(missing_ok=True)
-                tmp_webp.rename(dest_webp)
+                tmp_webp.replace(dest_webp)
                 return dest_webp
+            else:
+                # Dla .png i .jpg podmień jeśli mniejszy (lub przy drugim podejściu q=75 dla .jpg)
+                if new_size < orig_size or q == qualities_to_try[-1]:
+                    src_path.unlink(missing_ok=True)
+                    tmp_webp.replace(dest_webp)
+                    return dest_webp
     except OSError:
         pass
     finally:
@@ -546,7 +569,6 @@ def is_scene_doc(doc: dict) -> bool:
 
 
 def extract_raw_scenes_from_source(src_dir: Path):
-    """Wykrywa sceny z scenes.json, baz NeDB (packs/*.db) lub baz LevelDB (packs/*/*.ldb)."""
     scenes_json = src_dir / "scenes.json"
     if scenes_json.is_file():
         try:
@@ -743,7 +765,6 @@ def find_effective_source_dir(src_dir: Path) -> Path:
 
 
 def prune_unused_files_in_module(tmp_dir: Path, used_files: set[Path]):
-    """Usuwa z kopii modułu nieużywane pliki (bazy packs/, stare miniatury thumbs/, duplikaty z siatką, PDF-y)."""
     thumbs_dir = (tmp_dir / "_thumbs").resolve()
     keep_meta = {(tmp_dir / "scenes.json").resolve(), (tmp_dir / "module.json").resolve()}
 
@@ -850,15 +871,18 @@ def process_single_item(input_path: Path, out_root: Path, args) -> bool:
             print(f"[INFO] Wykryto źródło scen: {source_type} ({len(raw_scenes)} scen)")
 
         if not args.no_webp_convert:
-            to_convert = [
-                p for p in tmp_dir.rglob("*")
-                if p.is_file()
-                and not is_thumb_dir_part(p.relative_to(tmp_dir).parts)
-                and (
-                    p.suffix.lower() in (".avif", ".png")
-                    or (args.convert_jpg and p.suffix.lower() in (".jpg", ".jpeg"))
-                )
-            ]
+            to_convert = []
+            for p in tmp_dir.rglob("*"):
+                if not p.is_file() or is_thumb_dir_part(p.relative_to(tmp_dir).parts):
+                    continue
+                ext = p.suffix.lower()
+                if ext in (".avif", ".png"):
+                    to_convert.append(p)
+                elif args.convert_jpg and ext in (".jpg", ".jpeg"):
+                    to_convert.append(p)
+                elif args.shrink_big_webp and ext == ".webp" and p.stat().st_size > BIG_WEBP_THRESHOLD:
+                    to_convert.append(p)
+
             if to_convert:
                 print(f"[OPTYMALIZACJA] Konwersja {len(to_convert)} plików do .webp (jakość={args.quality})...")
                 with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -997,40 +1021,19 @@ def process_single_item(input_path: Path, out_root: Path, args) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Skrypt A: Uniwersalna normalizacja i optymalizacja modułów map.")
-    parser.add_argument(
-        "--input", "-i",
-        required=True,
-        help="Ścieżka do pliku .zip, folderu modułu lub katalogu nadrzędnego (w trybie --batch).",
-    )
-    parser.add_argument(
-        "--output-root", "-o",
-        default="/srv/data/foundry-maps/modules",
-        help="Katalog docelowy modułów (domyślnie: /srv/data/foundry-maps/modules).",
-    )
-    parser.add_argument(
-        "--batch", "-b",
-        action="store_true",
-        help="Tryb wsadowy: znajdź i przetwórz wszystkie pliki .zip oraz podfoldery wewnątrz --input.",
-    )
+    parser.add_argument("--input", "-i", required=True, help="Ścieżka do pliku .zip, folderu modułu lub katalogu nadrzędnego.")
+    parser.add_argument("--output-root", "-o", default="/srv/data/foundry-maps/modules", help="Katalog docelowy modułów.")
+    parser.add_argument("--batch", "-b", action="store_true", help="Tryb wsadowy.")
     parser.add_argument("--skip-existing", action="store_true", help="Pomiń moduły, które już istnieją w katalogu docelowym.")
     parser.add_argument("--overwrite", action="store_true", help="Nadpisz istniejące moduły bez pytania.")
     parser.add_argument("--delete-source-zip", action="store_true", help="Usuń źródłowy plik .zip po udanej normalizacji.")
     parser.add_argument("--no-webp-convert", action="store_true", help="Nie konwertuj plików .avif/.png do .webp.")
-    parser.add_argument("--convert-jpg", action="store_true", help="Konwertuj również pliki .jpg do .webp.")
-    parser.add_argument(
-        "--quality", "-q",
-        type=int,
-        default=90,
-        help="Jakość konwersji WebP dla pełnych map (domyślnie: 90).",
-    )
-    parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=min(8, os.cpu_count() or 4),
-        help="Liczba wątków generowania miniatur i konwersji WebP.",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Tylko pokaż co zostanie zrobione, bez zapisu na dysk.")
-    parser.add_argument("--non-interactive", action="store_true", help="Nie pytaj w konsoli, użyj wartości domyślnych.")
+    parser.add_argument("--convert-jpg", action="store_true", help="Konwertuj również pliki .jpg/.jpeg do .webp.")
+    parser.add_argument("--shrink-big-webp", action="store_true", help="Odchudź ciężkie pliki .webp (>3.5 MB).")
+    parser.add_argument("--quality", "-q", type=int, default=85, help="Jakość konwersji WebP (domyślnie: 85).")
+    parser.add_argument("--workers", "-w", type=int, default=min(12, os.cpu_count() or 4), help="Liczba wątków.")
+    parser.add_argument("--dry-run", action="store_true", help="Symulacja bez zapisu.")
+    parser.add_argument("--non-interactive", action="store_true", help="Użyj wartości domyślnych.")
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
