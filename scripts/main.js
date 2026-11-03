@@ -26,6 +26,161 @@ const naturalCollator = new Intl.Collator(undefined, {
 });
 
 /* -------------------------------------------- */
+/*  Efekt YouTube Ambient Light (Ambilight)     */
+/* -------------------------------------------- */
+
+let currentAmbilightSprite = null;
+
+function destroyAmbilightSprite() {
+    if (currentAmbilightSprite) {
+        try {
+            currentAmbilightSprite.parent?.removeChild(currentAmbilightSprite);
+            currentAmbilightSprite.destroy({ children: true, texture: true, baseTexture: true });
+        } catch {
+            // Ignoruj błędy przy czyszczeniu sceny
+        }
+        currentAmbilightSprite = null;
+    }
+}
+
+async function renderSceneAmbilight(canvasInstance) {
+    destroyAmbilightSprite();
+
+    try {
+        if (!game.settings.get(MODULE_ID, "enableAmbilight")) return;
+        if (!canvasInstance?.ready || !canvasInstance?.dimensions?.sceneRect) return;
+
+        const sr = canvasInstance.dimensions.sceneRect;
+        if (!sr || sr.width <= 0 || sr.height <= 0) return;
+
+        const bgSrc =
+        canvasInstance.level?.background?.src ||
+        canvasInstance.scene?.background?.src ||
+        canvasInstance.primary?.background?.texture?.baseTexture?.resource?.url;
+
+        if (!bgSrc || /\.(webm|mp4|m4v|ogg)$/i.test(bgSrc)) return;
+
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        const loaded = await new Promise((resolve) => {
+            img.onload = () => resolve(true);
+            img.onerror = () => resolve(false);
+            img.src = bgSrc;
+        });
+        if (!loaded || !canvasInstance.ready) return;
+
+        // Zachowaj proporcje mapy na płótnie pomocniczym, aby rozmycie było równe z każdej strony
+        const aspect = sr.width / sr.height;
+        const BASE_INNER = 360;
+        const innerW = aspect >= 1 ? BASE_INNER : Math.max(120, Math.round(BASE_INNER * aspect));
+        const innerH = aspect >= 1 ? Math.max(120, Math.round(BASE_INNER / aspect)) : BASE_INNER;
+        const MARGIN = 110;
+        const canvasW = innerW + MARGIN * 2;
+        const canvasH = innerH + MARGIN * 2;
+
+        const offCanvas = document.createElement("canvas");
+        offCanvas.width = canvasW;
+        offCanvas.height = canvasH;
+        const ctx = offCanvas.getContext("2d");
+
+        // Warstwa 1: Szeroka, miękka poświata zewnętrzna
+        ctx.save();
+        ctx.filter = "blur(42px) saturate(1.9) brightness(1.08)";
+        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.restore();
+
+        // Warstwa 2: Mocniejsza poświata blisko krawędzi mapy
+        ctx.save();
+        ctx.filter = "blur(20px) saturate(1.75) brightness(1.05)";
+        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.restore();
+
+        const tex = PIXI.Texture.from(offCanvas);
+        const sprite = new PIXI.Sprite(tex);
+
+        const padX = sr.width * (MARGIN / innerW);
+        const padY = sr.height * (MARGIN / innerH);
+
+        sprite.x = sr.x - padX;
+        sprite.y = sr.y - padY;
+        sprite.width = sr.width + padX * 2;
+        sprite.height = sr.height + padY * 2;
+        sprite.alpha = 1.0;
+        sprite.eventMode = "none";
+        sprite.interactiveChildren = false;
+
+        // Umieść poświatę w canvas.environment na samym spodzie (bezpośrednio POD mapą i tokenami)
+        const envContainer = canvasInstance.environment || canvasInstance.primary?.parent;
+        if (envContainer) {
+            envContainer.addChildAt(sprite, 0);
+            currentAmbilightSprite = sprite;
+        }
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Ambilight render warning:`, err);
+    }
+}
+
+/* -------------------------------------------- */
+/*  Domyślne parametry scen (padding 0, #000000)*/
+/* -------------------------------------------- */
+
+function buildDefaultSceneVisualUpdates(sceneDoc) {
+    const updates = {};
+
+    if (sceneDoc.padding !== 0) {
+        updates.padding = 0;
+    }
+    if (sceneDoc.backgroundColor !== "#000000") {
+        updates.backgroundColor = "#000000";
+    }
+    if (Scene.schema?.fields?.transition && sceneDoc.transition?.type !== "fade") {
+        updates.transition = foundry.utils.mergeObject(
+            sceneDoc.transition ? sceneDoc.transition.toObject?.() || sceneDoc.transition : {},
+                                                       { type: "fade" },
+                                                       { inplace: false }
+        );
+    }
+    if (sceneDoc.levels?.contents?.length > 0) {
+        const levelsArr = sceneDoc.levels.map(l => l.toObject());
+        let levelsChanged = false;
+        for (const l of levelsArr) {
+            if (l.background?.color !== "#000000") {
+                l.background = foundry.utils.mergeObject(l.background || {}, { color: "#000000" });
+                levelsChanged = true;
+            }
+        }
+        if (levelsChanged) {
+            updates.levels = levelsArr;
+        }
+    }
+
+    return updates;
+}
+
+async function enforceDefaultsOnAllExistingScenes() {
+    if (!game.user?.isGM) return;
+    if (!game.settings.get(MODULE_ID, "enforceSceneDefaults")) return;
+
+    const batch = [];
+    for (const s of game.scenes) {
+        const u = buildDefaultSceneVisualUpdates(s);
+        if (Object.keys(u).length > 0) {
+            u._id = s.id;
+            batch.push(u);
+        }
+    }
+
+    if (batch.length > 0) {
+        try {
+            await Scene.updateDocuments(batch);
+            console.log(`[${MODULE_ID}] Zaktualizowano domyślny wygląd (${batch.length} scen): padding=0, bg=#000000, transition=fade.`);
+        } catch (err) {
+            console.warn(`[${MODULE_ID}] Nie udało się zaktualizować części scen:`, err);
+        }
+    }
+}
+
+/* -------------------------------------------- */
 /*  Inicjalizacja i ustawienia                  */
 /* -------------------------------------------- */
 
@@ -52,6 +207,54 @@ Hooks.once("init", () => {
         default: "",
             onChange: resetCachesOnUrlChange
     });
+
+    game.settings.register(MODULE_ID, "enableAmbilight", {
+        name: "Efekt Ambient Light (YouTube Ambilight)",
+                           hint: "Dodaje pod mapą miękką, kolorową poświatę z jej krawędzi przechodzącą w czerń (#000000).",
+                           scope: "client",
+                           config: true,
+                           type: Boolean,
+        default: true,
+            onChange: () => {
+                if (canvas?.ready) renderSceneAmbilight(canvas);
+            }
+    });
+
+    game.settings.register(MODULE_ID, "enforceSceneDefaults", {
+        name: "Wymuszaj Padding 0, Czarne Tło (#000000) i Przejście Fade",
+                           hint: "Automatycznie ustawia padding=0, kolor tła #000000 i przejście 'fade' dla wszystkich istniejących i nowych scen.",
+                           scope: "world",
+                           config: true,
+                           type: Boolean,
+        default: true,
+            onChange: (val) => {
+                if (val) enforceDefaultsOnAllExistingScenes();
+            }
+    });
+});
+
+Hooks.once("ready", () => {
+    enforceDefaultsOnAllExistingScenes();
+});
+
+Hooks.on("preCreateScene", (sceneDoc) => {
+    if (!game.settings.get(MODULE_ID, "enforceSceneDefaults")) return;
+    const updates = {
+        padding: 0,
+        backgroundColor: "#000000"
+    };
+    if (Scene.schema?.fields?.transition) {
+        updates.transition = { type: "fade" };
+    }
+    sceneDoc.updateSource(updates);
+});
+
+Hooks.on("canvasReady", (canvasInstance) => {
+    renderSceneAmbilight(canvasInstance);
+});
+
+Hooks.on("canvasTearDown", () => {
+    destroyAmbilightSprite();
 });
 
 // Przycisk otwierania przeglądarki w katalogu Scen
@@ -89,6 +292,12 @@ Hooks.on("deleteScene", (scene) => {
     if (!scene?.getFlag?.(MODULE_ID, "moduleId")) return;
     if (browserInstance?.rendered && !browserInstance.isBulkImporting) {
         browserInstance.refreshGridOnly({ preserveScroll: true });
+    }
+});
+
+Hooks.on("updateScene", (sceneDoc, changed) => {
+    if (sceneDoc.id === canvas?.scene?.id && (changed.background || changed.levels || changed.width || changed.height || changed.padding !== undefined)) {
+        renderSceneAmbilight(canvas);
     }
 });
 
@@ -536,182 +745,191 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     }
 
-    const bgColor =
-    (typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
-    (typeof raw.bgColor === "string" && raw.bgColor) ||
-    "#000000";
+    // Zawsze wymuszaj czarne tło #000000 i padding 0
+    const bgColor = "#000000";
+    prepared.padding = 0;
 
-        if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
-        if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
+    if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
+    if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
 
-        if (typeof prepared.grid === "number" || !prepared.grid) {
-            const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
-            prepared.grid = {
-                size: gridSize || 100,
-                type: prepared.gridType ?? 1,
-                distance: prepared.gridDistance ?? 5,
-                units: prepared.gridUnits || "ft",
-                color: prepared.gridColor || "#000000",
-                alpha: prepared.gridAlpha ?? 0.2
-            };
-            delete prepared.gridType;
-            delete prepared.gridDistance;
-            delete prepared.gridUnits;
-            delete prepared.gridColor;
-            delete prepared.gridAlpha;
-        }
+    if (typeof prepared.grid === "number" || !prepared.grid) {
+        const gridSize = typeof prepared.grid === "number" ? prepared.grid : 100;
+        prepared.grid = {
+            size: gridSize || 100,
+            type: prepared.gridType ?? 1,
+            distance: prepared.gridDistance ?? 5,
+            units: prepared.gridUnits || "ft",
+            color: prepared.gridColor || "#000000",
+            alpha: prepared.gridAlpha ?? 0.2
+        };
+        delete prepared.gridType;
+        delete prepared.gridDistance;
+        delete prepared.gridUnits;
+        delete prepared.gridColor;
+        delete prepared.gridAlpha;
+    }
 
-        if (Array.isArray(prepared.walls)) {
-            prepared.walls = normalizeLegacyWalls(prepared.walls);
-        }
+    if (Array.isArray(prepared.walls)) {
+        prepared.walls = normalizeLegacyWalls(prepared.walls);
+    }
 
-        if (Array.isArray(prepared.tiles)) {
-            for (const tile of prepared.tiles) {
-                tile._id = ensureValidId(tile._id);
-                const tileSrc = tile.texture?.src || tile.img;
-                if (tileSrc) {
-                    try {
-                        const localTilePath = await downloadAssetToWorld(baseUrl, tileSrc, pack.moduleId, "tiles");
-                        tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: localTilePath });
-                    } catch {
-                        tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
-                            src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
-                        });
-                    }
+    if (Array.isArray(prepared.tiles)) {
+        for (const tile of prepared.tiles) {
+            tile._id = ensureValidId(tile._id);
+            const tileSrc = tile.texture?.src || tile.img;
+            if (tileSrc) {
+                try {
+                    const localTilePath = await downloadAssetToWorld(baseUrl, tileSrc, pack.moduleId, "tiles");
+                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, { src: localTilePath });
+                } catch {
+                    tile.texture = foundry.utils.mergeObject(tile.texture || {}, {
+                        src: resolveAssetUrl(baseUrl, tileSrc, pack.moduleId)
+                    });
                 }
-                delete tile.img;
             }
+            delete tile.img;
         }
+    }
 
-        if (Array.isArray(prepared.tokens)) {
-            for (const token of prepared.tokens) {
-                token._id = ensureValidId(token._id);
-                const tokSrc = token.texture?.src || token.img;
-                if (tokSrc) {
-                    try {
-                        const localTokPath = await downloadAssetToWorld(baseUrl, tokSrc, pack.moduleId, "tokens");
-                        token.texture = foundry.utils.mergeObject(token.texture || {}, { src: localTokPath });
-                    } catch {
-                        token.texture = foundry.utils.mergeObject(token.texture || {}, {
-                            src: resolveAssetUrl(baseUrl, tokSrc, pack.moduleId)
-                        });
-                    }
+    if (Array.isArray(prepared.tokens)) {
+        for (const token of prepared.tokens) {
+            token._id = ensureValidId(token._id);
+            const tokSrc = token.texture?.src || token.img;
+            if (tokSrc) {
+                try {
+                    const localTokPath = await downloadAssetToWorld(baseUrl, tokSrc, pack.moduleId, "tokens");
+                    token.texture = foundry.utils.mergeObject(token.texture || {}, { src: localTokPath });
+                } catch {
+                    token.texture = foundry.utils.mergeObject(token.texture || {}, {
+                        src: resolveAssetUrl(baseUrl, tokSrc, pack.moduleId)
+                    });
                 }
-                delete token.img;
             }
+            delete token.img;
         }
+    }
 
-        if (Array.isArray(prepared.sounds)) {
-            for (const sound of prepared.sounds) {
-                sound._id = ensureValidId(sound._id);
-                if (sound.path) {
-                    try {
-                        sound.path = await downloadAssetToWorld(baseUrl, sound.path, pack.moduleId, "audio");
-                    } catch {
-                        sound.path = resolveAssetUrl(baseUrl, sound.path, pack.moduleId);
-                    }
+    if (Array.isArray(prepared.sounds)) {
+        for (const sound of prepared.sounds) {
+            sound._id = ensureValidId(sound._id);
+            if (sound.path) {
+                try {
+                    sound.path = await downloadAssetToWorld(baseUrl, sound.path, pack.moduleId, "audio");
+                } catch {
+                    sound.path = resolveAssetUrl(baseUrl, sound.path, pack.moduleId);
                 }
             }
         }
+    }
 
-        if (typeof prepared.foreground === "string" && prepared.foreground) {
-            try {
-                prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
-            } catch {
-                delete prepared.foreground;
+    if (typeof prepared.foreground === "string" && prepared.foreground) {
+        try {
+            prepared.foreground = await downloadAssetToWorld(baseUrl, prepared.foreground, pack.moduleId, "tiles");
+        } catch {
+            delete prepared.foreground;
+        }
+    }
+
+    for (const key of ["lights", "templates", "notes", "drawings"]) {
+        if (Array.isArray(prepared[key])) {
+            for (const item of prepared[key]) {
+                item._id = ensureValidId(item._id);
             }
         }
+    }
 
-        for (const key of ["lights", "templates", "notes", "drawings"]) {
-            if (Array.isArray(prepared[key])) {
-                for (const item of prepared[key]) {
-                    item._id = ensureValidId(item._id);
-                }
-            }
+    delete prepared.img;
+    delete prepared.bgColor;
+    prepared.backgroundColor = bgColor;
+    prepared.background = foundry.utils.mergeObject(
+        typeof prepared.background === "object" && prepared.background ? prepared.background : {},
+        { src: localBgPath }
+    );
+
+    try {
+        if (typeof Scene.migrateData === "function") {
+            const migrated = Scene.migrateData(prepared);
+            Object.assign(prepared, migrated);
         }
+    } catch (err) {
+        console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
+    }
 
-        delete prepared.img;
-        delete prepared.bgColor;
-        prepared.backgroundColor = bgColor;
+    // Po migracji wymuś padding 0, czarne tło #000000 i przejście 'fade'
+    prepared.padding = 0;
+    prepared.backgroundColor = bgColor;
+    if (Scene.schema?.fields?.transition) {
+        prepared.transition = foundry.utils.mergeObject(
+            typeof prepared.transition === "object" && prepared.transition ? prepared.transition : {},
+            { type: "fade" }
+        );
+    }
+
+    if (localBgPath) {
         prepared.background = foundry.utils.mergeObject(
             typeof prepared.background === "object" && prepared.background ? prepared.background : {},
             { src: localBgPath }
         );
 
-        try {
-            if (typeof Scene.migrateData === "function") {
-                const migrated = Scene.migrateData(prepared);
-                Object.assign(prepared, migrated);
-            }
-        } catch (err) {
-            console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
-        }
+        if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
+            for (let i = 0; i < prepared.levels.length; i++) {
+                const lvl = prepared.levels[i];
+                const oldId = lvl._id;
+                lvl._id = ensureValidId(lvl._id);
+                if (prepared.initialLevel === oldId) prepared.initialLevel = lvl._id;
+                if (!lvl.name) lvl.name = i === 0 ? "Initial Level" : `Level ${i + 1}`;
 
-        if (localBgPath) {
-            prepared.background = foundry.utils.mergeObject(
-                typeof prepared.background === "object" && prepared.background ? prepared.background : {},
-                { src: localBgPath }
-            );
-
-            if (Array.isArray(prepared.levels) && prepared.levels.length > 0) {
-                for (let i = 0; i < prepared.levels.length; i++) {
-                    const lvl = prepared.levels[i];
-                    const oldId = lvl._id;
-                    lvl._id = ensureValidId(lvl._id);
-                    if (prepared.initialLevel === oldId) prepared.initialLevel = lvl._id;
-                    if (!lvl.name) lvl.name = i === 0 ? "Initial Level" : `Level ${i + 1}`;
-
-                    let lvlBg = localBgPath;
-                    if (lvl.background?.src && lvl.background.src !== rawBgPath && !lvl.background.src.startsWith("worlds/")) {
-                        try {
-                            lvlBg = await downloadAssetToWorld(baseUrl, lvl.background.src, pack.moduleId, "maps");
-                        } catch {
-                            lvlBg = localBgPath;
-                        }
-                    } else if (lvl.background?.src?.startsWith("worlds/")) {
-                        lvlBg = lvl.background.src;
+                let lvlBg = localBgPath;
+                if (lvl.background?.src && lvl.background.src !== rawBgPath && !lvl.background.src.startsWith("worlds/")) {
+                    try {
+                        lvlBg = await downloadAssetToWorld(baseUrl, lvl.background.src, pack.moduleId, "maps");
+                    } catch {
+                        lvlBg = localBgPath;
                     }
-
-                    if (i === 0 || lvl.background?.src) {
-                        lvl.background = foundry.utils.mergeObject(
-                            typeof lvl.background === "object" && lvl.background ? lvl.background : {},
-                            { src: lvlBg, color: bgColor }
-                        );
-                    }
+                } else if (lvl.background?.src?.startsWith("worlds/")) {
+                    lvlBg = lvl.background.src;
                 }
-            } else if (Scene.schema?.fields?.levels) {
-                const levelId = foundry.utils.randomID();
-                prepared.levels = [
-                    {
-                        _id: levelId,
-                        name: "Initial Level",
-                        background: {
-                            src: localBgPath,
-                            color: bgColor
-                        }
-                    }
-                ];
-                if ("initialLevel" in Scene.schema.fields) {
-                    prepared.initialLevel = levelId;
+
+                if (i === 0 || lvl.background?.src) {
+                    lvl.background = foundry.utils.mergeObject(
+                        typeof lvl.background === "object" && lvl.background ? lvl.background : {},
+                        { src: lvlBg, color: bgColor }
+                    );
                 }
             }
-        }
-
-        prepared.folder = folderId;
-        if (localThumbPath) {
-            prepared.thumb = localThumbPath;
-        }
-
-        prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
-            [MODULE_ID]: {
-                moduleId: pack.moduleId,
-                sceneId: originalId,
-                version: pack.version || "1.0.0",
-                bgPath: localBgPath
+        } else if (Scene.schema?.fields?.levels) {
+            const levelId = foundry.utils.randomID();
+            prepared.levels = [
+                {
+                    _id: levelId,
+                    name: "Initial Level",
+                    background: {
+                        src: localBgPath,
+                        color: bgColor
+                    }
+                }
+            ];
+            if ("initialLevel" in Scene.schema.fields) {
+                prepared.initialLevel = levelId;
             }
-        });
+        }
+    }
 
-        return prepared;
+    prepared.folder = folderId;
+    if (localThumbPath) {
+        prepared.thumb = localThumbPath;
+    }
+
+    prepared.flags = foundry.utils.mergeObject(prepared.flags || {}, {
+        [MODULE_ID]: {
+            moduleId: pack.moduleId,
+            sceneId: originalId,
+            version: pack.version || "1.0.0",
+            bgPath: localBgPath
+        }
+    });
+
+    return prepared;
 }
 
 async function ensureCreatedScenesHaveLevelBg(createdDocs) {
@@ -721,9 +939,12 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
         if (!expectedBg) continue;
 
         const firstLevel = sceneDoc.levels?.contents?.[0];
-        if (firstLevel && firstLevel.background?.src !== expectedBg) {
+        if (firstLevel && (firstLevel.background?.src !== expectedBg || firstLevel.background?.color !== "#000000")) {
             try {
-                await firstLevel.update({ "background.src": expectedBg });
+                await firstLevel.update({
+                    "background.src": expectedBg,
+                    "background.color": "#000000"
+                });
             } catch (err) {
                 console.warn(`[${MODULE_ID}] Failed to update level background:`, err);
             }
@@ -1314,7 +1535,7 @@ class HomelabMapBrowser extends BaseApp {
         this.packImportHeaderBtn.style.display = "";
         this.packImportHeaderBtn.disabled = packStatus.isFullyImported;
         this.packImportHeaderBtn.innerHTML = `
-        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
+        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}</i>
         ${packStatus.isFullyImported
             ? `${game.i18n.localize("ZMB.InWorld")} (${packStatus.importedCount}/${packStatus.totalCount})`
             : `${game.i18n.localize("ZMB.ImportPackBtn")} (${packStatus.importedCount}/${packStatus.totalCount})`}
