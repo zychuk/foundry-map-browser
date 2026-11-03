@@ -324,24 +324,24 @@ Hooks.once("init", () => {
     });
 
     game.settings.register(MODULE_ID, "enableAmbilight", {
-        name: "Efekt Ambient Light (YouTube Ambilight)",
-                           hint: "Dodaje pod mapą miękką, kolorową poświatę z jej krawędzi przechodzącą w czerń (#000000).",
-                           scope: "client",
-                           config: true,
-                           type: Boolean,
-        default: true,
+        name: "ZMB.EnableAmbilightName",
+        hint: "ZMB.EnableAmbilightHint",
+        scope: "client",
+        config: true,
+        type: Boolean,
+        default: false,
             onChange: () => {
                 if (canvas?.ready) renderSceneAmbilight(canvas);
             }
     });
 
     game.settings.register(MODULE_ID, "enforceSceneDefaults", {
-        name: "Wymuszaj Padding 0, Czarne Tło (#000000) i Przejście Fade",
-                           hint: "Automatycznie ustawia padding=0, kolor tła #000000 i przejście 'fade' dla wszystkich istniejących i nowych scen.",
-                           scope: "world",
-                           config: true,
-                           type: Boolean,
-        default: true,
+        name: "ZMB.EnforceSceneDefaultsName",
+        hint: "ZMB.EnforceSceneDefaultsHint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: false,
             onChange: (val) => {
                 if (val) enforceDefaultsOnAllExistingScenes();
             }
@@ -866,9 +866,16 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     }
 
-    // Zawsze wymuszaj czarne tło #000000 i padding 0
-    const bgColor = "#000000";
-    prepared.padding = 0;
+    const enforceDefaults = Boolean(game.settings.get(MODULE_ID, "enforceSceneDefaults"));
+    const bgColor = enforceDefaults
+    ? "#000000"
+    : ((typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
+    (typeof raw.bgColor === "string" && raw.bgColor) ||
+    "#000000");
+
+    if (enforceDefaults) {
+        prepared.padding = 0;
+    }
 
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
@@ -976,14 +983,15 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // Po migracji wymuś padding 0, czarne tło #000000 i przejście 'fade'
-    prepared.padding = 0;
-    prepared.backgroundColor = bgColor;
-    if (Scene.schema?.fields?.transition) {
-        prepared.transition = foundry.utils.mergeObject(
-            typeof prepared.transition === "object" && prepared.transition ? prepared.transition : {},
-            { type: "fade" }
-        );
+    if (enforceDefaults) {
+        prepared.padding = 0;
+        prepared.backgroundColor = "#000000";
+        if (Scene.schema?.fields?.transition) {
+            prepared.transition = foundry.utils.mergeObject(
+                typeof prepared.transition === "object" && prepared.transition ? prepared.transition : {},
+                { type: "fade" }
+            );
+        }
     }
 
     if (localBgPath) {
@@ -1055,17 +1063,25 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
 
 async function ensureCreatedScenesHaveLevelBg(createdDocs) {
     if (!Array.isArray(createdDocs)) return;
+    const enforceDefaults = Boolean(game.settings.get(MODULE_ID, "enforceSceneDefaults"));
+
     for (const sceneDoc of createdDocs) {
         const expectedBg = sceneDoc.getFlag(MODULE_ID, "bgPath");
         if (!expectedBg) continue;
 
         const firstLevel = sceneDoc.levels?.contents?.[0];
-        if (firstLevel && (firstLevel.background?.src !== expectedBg || firstLevel.background?.color !== "#000000")) {
+        if (!firstLevel) continue;
+
+        const needsSrcUpdate = firstLevel.background?.src !== expectedBg;
+        const needsColorUpdate = enforceDefaults && firstLevel.background?.color !== "#000000";
+
+        if (needsSrcUpdate || needsColorUpdate) {
             try {
-                await firstLevel.update({
-                    "background.src": expectedBg,
-                    "background.color": "#000000"
-                });
+                const updateData = { "background.src": expectedBg };
+                if (enforceDefaults) {
+                    updateData["background.color"] = "#000000";
+                }
+                await firstLevel.update(updateData);
             } catch (err) {
                 console.warn(`[${MODULE_ID}] Failed to update level background:`, err);
             }
