@@ -2,7 +2,7 @@
 
 **A Foundry VTT module that lists map packs from a remote server and imports them into your active world.**
 
-It adds a **Map Browser** button to the Scenes directory where the GM can search packs, filter them, and import them as scenes.
+It adds a **Map Browser** button to the Scenes directory where the GM can search packs, filter them, preview full-resolution variants, and import packs or individual scenes.
 
 > [!NOTE]
 > On import, the module downloads the map assets and saves them in the world's directory (`worlds/<worldId>/zychu-maps/`). Imported scenes use these local files, so they keep working even if the remote server goes offline.
@@ -13,13 +13,14 @@ It adds a **Map Browser** button to the Scenes directory where the GM can search
 
 - [Installation](#-installation)
 - [Usage](#-usage)
+- [Module settings](#️-module-settings)
 - [Remote server setup](#-remote-server-setup)
   - [Folder structure](#folder-structure)
   - [catalog.json format](#catalogjson-format)
   - [scenes.json format](#scenesjson-format)
   - [CORS configuration](#cors-configuration)
   - [Maintenance scripts](#maintenance-scripts)
-- [Development notes](#-development-notes)
+- [Development notes](#️-development-notes)
 
 ---
 
@@ -38,11 +39,21 @@ https://github.com/zychuk/foundry-map-browser/releases/latest/download/module.js
 1. Enable the module in **Manage Modules**.
 2. Go to **Configure Settings › Module Settings › Zychu's Map Browser** and enter the **Map Server URL** (for example, `https://maps.yourdomain.com`).
 3. Open the **Scenes** directory in the right sidebar and click **Map Browser** at the top.
-4. Search by name, or filter by category and by status (**All**, **Imported**, **Not Imported**).
+4. Search by name, or filter by category (**All**, **Battlemaps**, **Scenes**) and by status (**All**, **Imported**, **Not Imported**).
 5. Click **Import** on a pack to download all its scenes into a folder named `Zychu Maps / <Pack Name>`.
-   Click **Scenes** to preview a pack, inspect full-resolution previews by clicking a scene's thumbnail, and import individual scenes.
+   Click **Scenes** (or the pack thumbnail) to browse variants inside a pack, click a scene's thumbnail to open a full-resolution preview, and import or open individual scenes.
 
 Imported scenes are tagged with module flags. The status shown for each pack (**Imported**, **Partial**, **Not Imported**) updates automatically when scenes are added to or deleted from the world.
+
+---
+
+## ⚙️ Module settings
+
+| Setting | Scope | Default | Description |
+| --- | --- | --- | --- |
+| **Map Server URL** | World | `""` | Base URL of the remote server hosting `catalog.json` and the `modules/` directory (without a trailing slash). |
+| **Ambient Light Effect (YouTube Ambilight)** | Client | `false` | Renders a soft, blurred color glow around the edges of the active map that fades into `#000000` black. Works on both static images (`.webp`, `.jpg`, `.png`) and animated scenes (`.mp4`, `.webm`). Generated in memory on scene load with zero disk usage. |
+| **Enforce Padding 0, Black Background (`#000000`) & Fade Transition** | World | `false` | Automatically sets `padding: 0`, `backgroundColor: "#000000"`, and `transition.type: "fade"` (Foundry v14) on newly imported or newly created scenes without modifying existing scenes or shifting object coordinates. |
 
 ---
 
@@ -109,12 +120,12 @@ The web server (Caddy, Nginx, Apache, etc.) should serve a root directory like t
 | Field | Description |
 | --- | --- |
 | `category` | `"map"` for battlemaps, `"scene"` for environments and portraits. |
-| `cover` | Thumbnail shown on the pack tile. If it is missing or returns a 404, the module uses the first thumbnail in `scenes`. |
+| `cover` | Thumbnail shown on the pack tile. If it is missing or returns a 404, the module falls back to the first available thumbnail in `scenes`. |
 | `sceneCount` | Optional. The module uses the length of the `scenes` array instead. |
 
 ### scenes.json format
 
-Each module folder contains a `scenes.json` file with standard Foundry VTT Scene data objects. The module works with the data structures from **v9 through v14**.
+Each module folder contains a `scenes.json` file with standard Foundry VTT Scene data objects. The module works with scene structures from **v9 through v14**.
 
 ```json
 [
@@ -128,6 +139,7 @@ Each module folder contains a `scenes.json` file with standard Foundry VTT Scene
       "src": "modules/example-pack-01/maps/example-map-day.webp"
     },
     "walls": [],
+    "lights": [],
     "tiles": []
   }
 ]
@@ -136,7 +148,7 @@ Each module folder contains a `scenes.json` file with standard Foundry VTT Scene
 ### CORS configuration
 
 > [!IMPORTANT]
-> The server must send CORS headers so Foundry can fetch the image files during import.
+> The server must send CORS headers so Foundry can fetch the image files during import (and sample textures for the Ambilight effect).
 
 Example for Caddy:
 
@@ -162,43 +174,51 @@ Python 3 scripts are included in `utility/` for maintaining the remote catalog a
 
 Works on a copy of a raw image folder, a `.zip` module, or a `--batch` parent folder. It:
 
-- extracts scenes from `scenes.json`, NeDB (`packs/*.db`), or Foundry v11–v14 LevelDB (`packs/*/*.ldb`)
-- converts `.avif`/`.png` (and optionally `.jpg`) maps to `.webp`
-- generates `.webp` thumbnails
-- removes unused files
-- writes a clean `scenes.json`
+- extracts scenes from `scenes.json`, legacy NeDB (`packs/*.db`), or Foundry v11–v14 LevelDB (`packs/*/*.ldb` and `*.log`)
+- converts `.avif`/`.png` (and with `--convert-jpg`, `.jpg`/`.jpeg`) maps and oversized `.webp` files (`--shrink-big-webp`) to `.webp`
+- generates `.webp` thumbnails in `_thumbs/` with hashed filenames to prevent subfolder name collisions
+- prunes unused files (compendium databases, duplicate gridded maps, PDFs, old thumbnail folders)
+- writes a clean `scenes.json` and `module.json`
 
 ```bash
 python3 utility/normalize_module.py --input /path/to/raw-pack --dry-run
-python3 utility/normalize_module.py --input /path/to/raw-pack --convert-jpg --shrink-big-webp
+python3 utility/normalize_module.py --input /path/to/raw-packs --output-root /path/to/modules --batch --convert-jpg --shrink-big-webp --non-interactive
 ```
 
-#### 2. `utility/update_catalog.py`
+#### 2. `utility/optimize_existing.py`
+
+Scans an existing `modules/` directory in-place, converts remaining `.avif`/`.png`/`.jpg` files and oversized `.webp` files (`> 3.5 MB`) to `.webp`, updates `scenes.json`, and removes unreferenced files.
+
+```bash
+python3 utility/optimize_existing.py --modules-dir /srv/data/foundry-maps/modules --quality 85
+```
+
+#### 3. `utility/update_catalog.py`
 
 Scans the `modules/` folder and:
 
-- adds new packs, and optionally updates modified packs or prunes deleted ones
+- adds new packs, and optionally updates modified packs (`--update-existing`) or prunes deleted ones (`--prune`)
 - makes a timestamped backup of `catalog.json`
-- fixes missing cover paths
+- fixes missing or outdated cover paths (`--fix-missing-covers`)
 - validates the JSON syntax and writes the file atomically
 
 ```bash
 python3 utility/update_catalog.py --fix-missing-covers --update-existing --prune --dry-run
-python3 utility/update_catalog.py --fix-missing-covers --update-existing --prune
+python3 utility/update_catalog.py --fix-missing-covers --update-existing --prune --non-interactive
 ```
 
-#### 3. `utility/build_art_catalog.py`
+#### 4. `utility/build_art_catalog.py`
 
-Recursively scans the `art/` folder, generates `.webp` thumbnails with a white background behind transparent PNG/WebP files, and writes `art_catalog.json`.
+Recursively scans the `art/` folder, generates `.webp` thumbnails with a white background behind transparent PNG/WebP files, removes orphaned thumbnails (`--clean-orphans`), and writes `art_catalog.json`.
 
 ```bash
 python3 utility/build_art_catalog.py --clean-orphans --dry-run
 python3 utility/build_art_catalog.py --clean-orphans
 ```
 
-#### 4. `utility/rename_pdf_images.py`
+#### 5. `utility/rename_pdf_images.py`
 
-Uses a local Ollama vision model (`qwen2.5vl:7b`) to bulk-rename images extracted from PDFs (with technical names like `p003_native_xref24.png`) into descriptive 3–4 word English RPG filenames, with automatic `1`, `2` numbering for duplicates.
+Uses a local Ollama vision model (`qwen2.5vl:7b`) with two-step visual grounding (`observation` → `name`) to bulk-rename images extracted from PDFs (with technical names like `p003_native_xref24.png`) into descriptive 3–4 word English RPG filenames, with automatic `1`, `2` numbering for duplicates.
 
 ```bash
 # Start Ollama and ensure qwen2.5vl:7b is pulled
@@ -222,6 +242,14 @@ sudo systemctl stop ollama
 
 ## 🛠️ Development notes
 
-- **Local storage:** Imported maps, tokens, tiles, audio, and thumbnails are stored in `worlds/<worldId>/zychu-maps/<moduleId>/`. Existing files in the world folder are reused without re-downloading. Deleting a world also removes this folder.
-- **Localization:** UI strings are in `lang/pl.json` and `lang/en.json`. New UI text should use `game.i18n.localize("ZMB.Key")`.
-- **Foundry v14:** The module migrates `scene.levels` data so background images are assigned to the Initial Level while preserving multi-level scene backgrounds.
+- **Modular structure (`scripts/`):**
+  - `scripts/main.js` — Entry point, module settings, and Foundry VTT hooks.
+  - `scripts/constants.js` — Shared constants, chunk size, and natural sort collator.
+  - `scripts/ambilight.js` — Canvas Ambilight effect for static and video backgrounds.
+  - `scripts/catalog.js` — Remote `catalog.json` / `scenes.json` fetching, URL resolution, and world scene indexing.
+  - `scripts/importer.js` — Serialized `FilePicker` asset downloader (`enqueueServerOp`) and v9–v14 scene/wall/tile data migration.
+  - `scripts/browser-app.js` — `ApplicationV2` UI window, chunked virtual grid (`ZMB_CHUNK_SIZE = 36`), event delegation, and lazy `ThumbnailQueue`.
+- **UI & window-drag performance:** The browser renders cards in 36-item chunks on scroll using `IntersectionObserver`, applies `content-visibility: auto` to off-screen tiles, and disables pointer hit-testing inside the grid while dragging the window header.
+- **Local storage & upload queue:** Imported maps, tokens, tiles, audio, and thumbnails are stored in `worlds/<worldId>/zychu-maps/<moduleId>/`. Existing files in the world folder are detected via `FilePicker.browse` and reused without re-downloading. File uploads are strictly serialized to prevent Node.js memory spikes on Docker/Alpine servers.
+- **Foundry v14 compatibility:** The module migrates `Scene#levels` data so background images are assigned to the Initial Level while preserving multi-level scene backgrounds, and automatically converts deprecated v10–v13 overhead tile occlusion modes (`ROOF = 2`, `RADIAL = 3`) to valid Foundry v14 occlusion modes (`VISION`, `FADE`).
+- **Localization:** UI and settings strings are in `lang/pl.json` and `lang/en.json`.
