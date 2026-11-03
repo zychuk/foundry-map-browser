@@ -86,13 +86,13 @@ async function renderSceneAmbilight(canvasInstance) {
         // Warstwa 1: Szeroka, miękka poświata zewnętrzna
         ctx.save();
         ctx.filter = "blur(42px) saturate(1.9) brightness(1.08)";
-        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.drawImage(img, MARGIN - 16, MARGIN - 16, innerW + 32, innerH + 32);
         ctx.restore();
 
         // Warstwa 2: Mocniejsza poświata blisko krawędzi mapy
         ctx.save();
         ctx.filter = "blur(20px) saturate(1.75) brightness(1.05)";
-        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.drawImage(img, MARGIN - 16, MARGIN - 16, innerW + 32, innerH + 32);
         ctx.restore();
 
         const tex = PIXI.Texture.from(offCanvas);
