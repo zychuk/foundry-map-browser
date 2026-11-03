@@ -261,3 +261,20 @@
     text-align: center;
     opacity: 0.75;
 }
+
+.zmb-tile {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 210px;
+}
+
+.zmb-sentinel {
+    grid-column: 1 / -1;
+    width: 100%;
+    height: 4px;
+    pointer-events: none;
+}
+
+.zmb-container.is-dragging,
+.zmb-container.is-dragging * {
+    pointer-events: none !important;
+}
