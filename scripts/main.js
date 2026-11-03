@@ -842,6 +842,46 @@ function normalizeLegacyWalls(walls) {
     }).filter(Boolean);
 }
 
+/**
+ * Naprawia niekompatybilne tryby okluzji kafelków (np. usunięty w Foundry v14 tryb RADIAL = 3 oraz stary ROOF = 2).
+ */
+function sanitizeTileOcclusion(tile) {
+    if (!tile || typeof tile.occlusion !== "object" || !tile.occlusion) return;
+
+    const validModes = new Set(
+        Object.values(CONST?.TILE_OCCLUSION_MODES || {}).filter(v => v !== undefined && v !== null)
+    );
+    const fadeMode = CONST?.TILE_OCCLUSION_MODES?.FADE ?? 1;
+    const visionMode = CONST?.TILE_OCCLUSION_MODES?.VISION ?? fadeMode;
+
+    const mapSingleMode = (m) => {
+        if (validModes.size > 0 && validModes.has(m)) return m;
+        if (m === 2) return visionMode; // Stary ROOF -> VISION
+        if (m === 3) return fadeMode;   // Usunięty w v14 RADIAL (3) -> FADE
+        return fadeMode;
+    };
+
+    if (typeof tile.occlusion.mode === "number") {
+        if (tile.occlusion.mode === 0) {
+            if (!validModes.has(0)) delete tile.occlusion.mode;
+        } else if (!validModes.has(tile.occlusion.mode)) {
+            tile.occlusion.mode = mapSingleMode(tile.occlusion.mode);
+        }
+    }
+
+    if (Array.isArray(tile.occlusion.modes)) {
+        const cleaned = [];
+        for (const m of tile.occlusion.modes) {
+            if (m === 0 || m === null || m === undefined) continue;
+            const mapped = mapSingleMode(m);
+            if ((validModes.size === 0 || validModes.has(mapped)) && !cleaned.includes(mapped)) {
+                cleaned.push(mapped);
+            }
+        }
+        tile.occlusion.modes = cleaned;
+    }
+}
+
 async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUrl) {
     const originalId = raw._id || meta?.id;
     const prepared = foundry.utils.deepClone(raw);
@@ -907,6 +947,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
             tile._id = ensureValidId(tile._id);
+            sanitizeTileOcclusion(tile);
             const tileSrc = tile.texture?.src || tile.img;
             if (tileSrc) {
                 try {
@@ -984,6 +1025,13 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     } catch (err) {
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
+    }
+
+    // Po migracji ponownie oczyść tryby okluzji kafelków (np. gdyby Scene.migrateData przepisało mode: 3 do modes: [3])
+    if (Array.isArray(prepared.tiles)) {
+        for (const tile of prepared.tiles) {
+            sanitizeTileOcclusion(tile);
+        }
     }
 
     if (enforceDefaults) {
