@@ -237,6 +237,59 @@ async function renderSceneAmbilight(canvasInstance) {
 }
 
 /* -------------------------------------------- */
+/*  Przeliczanie współrzędnych przy Padding = 0 */
+/* -------------------------------------------- */
+
+function computePaddingPixelOffset(width, height, grid, padding) {
+    if (!padding || padding <= 0) return { dx: 0, dy: 0 };
+    try {
+        if (typeof Canvas?.getDimensions === "function") {
+            const d = Canvas.getDimensions({ width, height, grid, padding });
+            if (Number.isFinite(d?.sceneX) && Number.isFinite(d?.sceneY)) {
+                return { dx: d.sceneX, dy: d.sceneY };
+            }
+        }
+    } catch {
+        // Fallback poniżej
+    }
+    const gridSize = Number(typeof grid === "object" ? grid?.size : grid) || 100;
+    return {
+        dx: Math.ceil(((Number(width) || 4000) * padding) / gridSize) * gridSize,
+        dy: Math.ceil(((Number(height) || 3000) * padding) / gridSize) * gridSize
+    };
+}
+
+/**
+ * Przesuwa wszystkie elementy osadzone na scenie (kafelki, ściany, światła, dźwięki, tokeny, notatki, rysunki)
+ * o (-dx, -dy) przy zmianie paddingu z wartości > 0 na 0, aby nie rozjeżdżały się względem tła mapy.
+ */
+function shiftEmbeddedForPaddingChange(sceneData, dx, dy) {
+    if (!dx && !dy) return;
+
+    if (Array.isArray(sceneData.tiles)) {
+        for (const t of sceneData.tiles) {
+            if (typeof t.x === "number") t.x -= dx;
+            if (typeof t.y === "number") t.y -= dy;
+        }
+    }
+    if (Array.isArray(sceneData.walls)) {
+        for (const w of sceneData.walls) {
+            if (Array.isArray(w.c) && w.c.length === 4) {
+                w.c = [w.c[0] - dx, w.c[1] - dy, w.c[2] - dx, w.c[3] - dy];
+            }
+        }
+    }
+    for (const key of ["lights", "sounds", "tokens", "notes", "drawings", "templates"]) {
+        if (Array.isArray(sceneData[key])) {
+            for (const item of sceneData[key]) {
+                if (typeof item.x === "number") item.x -= dx;
+                if (typeof item.y === "number") item.y -= dy;
+            }
+        }
+    }
+}
+
+/* -------------------------------------------- */
 /*  Domyślne parametry scen (padding 0, #000000)*/
 /* -------------------------------------------- */
 
@@ -244,8 +297,42 @@ function buildDefaultSceneVisualUpdates(sceneDoc) {
     const updates = {};
 
     if (sceneDoc.padding !== 0) {
+        const oldPad = Number(sceneDoc.padding) || 0;
+        const { dx, dy } = computePaddingPixelOffset(sceneDoc.width, sceneDoc.height, sceneDoc.grid, oldPad);
         updates.padding = 0;
+
+        if (dx || dy) {
+            if (sceneDoc.tiles?.size > 0) {
+                updates.tiles = sceneDoc.tiles.map(t => {
+                    const obj = t.toObject();
+                    obj.x = (Number(obj.x) || 0) - dx;
+                    obj.y = (Number(obj.y) || 0) - dy;
+                    return obj;
+                });
+            }
+            if (sceneDoc.walls?.size > 0) {
+                updates.walls = sceneDoc.walls.map(w => {
+                    const obj = w.toObject();
+                    if (Array.isArray(obj.c) && obj.c.length === 4) {
+                        obj.c = [obj.c[0] - dx, obj.c[1] - dy, obj.c[2] - dx, obj.c[3] - dy];
+                    }
+                    return obj;
+                });
+            }
+            for (const key of ["lights", "sounds", "tokens", "notes", "drawings", "templates"]) {
+                const coll = sceneDoc[key];
+                if (coll?.size > 0) {
+                    updates[key] = coll.map(item => {
+                        const obj = item.toObject();
+                        if (typeof obj.x === "number") obj.x -= dx;
+                        if (typeof obj.y === "number") obj.y -= dy;
+                        return obj;
+                    });
+                }
+            }
+        }
     }
+
     if (sceneDoc.backgroundColor !== "#000000") {
         updates.backgroundColor = "#000000";
     }
@@ -887,6 +974,9 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     const prepared = foundry.utils.deepClone(raw);
     delete prepared._id;
 
+    // Zapamiętaj oryginalny padding sceny (w Foundry domyślnie 0.25, jeśli pole nie było podane)
+    const originalPadding = typeof raw.padding === "number" ? raw.padding : 0.25;
+
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
@@ -915,10 +1005,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     : ((typeof raw.backgroundColor === "string" && raw.backgroundColor) ||
     (typeof raw.bgColor === "string" && raw.bgColor) ||
     "#000000");
-
-    if (enforceDefaults) {
-        prepared.padding = 0;
-    }
 
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
@@ -1027,14 +1113,18 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // Po migracji ponownie oczyść tryby okluzji kafelków (np. gdyby Scene.migrateData przepisało mode: 3 do modes: [3])
     if (Array.isArray(prepared.tiles)) {
         for (const tile of prepared.tiles) {
             sanitizeTileOcclusion(tile);
         }
     }
 
+    // Jeśli wymuszamy padding = 0, przesuń kafelki, ściany i światła o różnicę oryginalnego paddingu
     if (enforceDefaults) {
+        if (originalPadding > 0) {
+            const { dx, dy } = computePaddingPixelOffset(prepared.width, prepared.height, prepared.grid, originalPadding);
+            shiftEmbeddedForPaddingChange(prepared, dx, dy);
+        }
         prepared.padding = 0;
         prepared.backgroundColor = "#000000";
         if (Scene.schema?.fields?.transition) {
@@ -1598,381 +1688,4 @@ class HomelabMapBrowser extends BaseApp {
         if (!this.gridContainer) return;
 
         this.gridContainer.addEventListener("click", async (ev) => {
-            const actionEl = ev.target.closest("[data-action]");
-            if (!actionEl) return;
-            const tileEl = actionEl.closest(".zmb-tile[data-idx]");
-            if (!tileEl) return;
-
-            const idx = Number(tileEl.dataset.idx);
-            const item = this.activeList[idx];
-            if (!item) return;
-
-            const action = actionEl.dataset.action;
-
-            if (this.activeViewType === "packs") {
-                if (action === "open-pack") {
-                    this._openPack(item.pack);
-                } else if (action === "import-pack") {
-                    const btn = actionEl;
-                    if (btn.disabled) return;
-                    const progressFill = tileEl.querySelector(".zmb-progress-fill");
-                    btn.disabled = true;
-                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                    try {
-                        await importPackToWorld(item.pack, (current, total) => {
-                            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`;
-                            if (progressFill && total > 0) {
-                                progressFill.style.width = `${Math.round((current / total) * 100)}%`;
-                            }
-                        });
-                        this.refreshGridOnly({ preserveScroll: true });
-                    } catch (err) {
-                        ui.notifications.error(err.message);
-                        if (progressFill) progressFill.style.width = "0%";
-                        if (btn.isConnected) {
-                            btn.disabled = false;
-                            btn.innerHTML = `<i class="fa-solid fa-file-import"></i> ${game.i18n.localize("ZMB.Import")}`;
-                        }
-                    }
-                }
-            } else if (this.activeViewType === "scenes") {
-                const pack = this.selectedPack;
-                if (!pack) return;
-                const { sceneMeta } = item;
-
-                if (action === "preview-scene") {
-                    const baseUrl = getServerUrl();
-                    const previewUrl = resolveAssetUrl(baseUrl, sceneMeta.bg || sceneMeta.thumb, pack.moduleId);
-                    openImagePreview(previewUrl, sceneMeta.name || game.i18n.localize("ZMB.SceneDefaultName"));
-                } else if (action === "import-scene") {
-                    const btn = actionEl;
-                    if (btn.disabled) return;
-                    btn.disabled = true;
-                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                    try {
-                        await importSingleSceneToWorld(pack, sceneMeta);
-                        this.refreshGridOnly({ preserveScroll: true });
-                    } catch (err) {
-                        ui.notifications.error(err.message);
-                        if (btn.isConnected) {
-                            btn.disabled = false;
-                            btn.innerHTML = `<i class="fa-solid fa-download"></i> ${game.i18n.localize("ZMB.Import")}`;
-                        }
-                    }
-                } else if (action === "open-scene") {
-                    const btn = actionEl;
-                    if (btn.disabled) return;
-                    btn.disabled = true;
-                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-                    try {
-                        const currentWorldIndex = buildWorldSceneIndex();
-                        const existingScene = findWorldScene(currentWorldIndex, pack.moduleId, sceneMeta.id);
-                        const targetScene = existingScene || (await importSingleSceneToWorld(pack, sceneMeta));
-                        this.refreshGridOnly({ preserveScroll: true });
-                        if (targetScene) targetScene.view();
-                    } catch (err) {
-                        ui.notifications.error(err.message);
-                        if (btn.isConnected) {
-                            btn.disabled = false;
-                            btn.innerHTML = `<i class="fa-solid fa-eye"></i> ${game.i18n.localize("ZMB.Open")}`;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    _bindToolbarEvents(wrapper) {
-        const statusSelect = wrapper.querySelector(".zmb-status-filter");
-        const catSelect = wrapper.querySelector(".zmb-cat-filter");
-        const refreshBtn = wrapper.querySelector(".zmb-refresh-btn");
-        const backBtn = wrapper.querySelector(".zmb-back-btn");
-
-        wrapper.addEventListener("keydown", (ev) => {
-            if (ev.key === "Escape" && this.selectedPack && !this.isBulkImporting) {
-                if (document.activeElement === this.searchInput && this.searchQuery) {
-                    return;
-                }
-                ev.preventDefault();
-                ev.stopPropagation();
-                this._goBackToPacks();
-            }
-        });
-
-        this.searchInput.addEventListener("input", (ev) => {
-            clearTimeout(this.searchTimeout);
-            this.searchTimeout = setTimeout(() => {
-                this.searchQuery = ev.target.value.trim().toLowerCase();
-                this.refreshGridOnly({ scrollTop: 0 });
-            }, 100);
-        });
-
-        statusSelect.addEventListener("change", (ev) => {
-            this.filterStatus = ev.target.value;
-            this.refreshGridOnly({ scrollTop: 0 });
-        });
-
-        catSelect.addEventListener("change", (ev) => {
-            this.filterCategory = ev.target.value;
-            this.refreshGridOnly({ scrollTop: 0 });
-        });
-
-        this.packImportHeaderBtn.addEventListener("click", async (ev) => {
-            if (!this.selectedPack) return;
-            const pack = this.selectedPack;
-            const btn = ev.currentTarget;
-            btn.disabled = true;
-            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
-            try {
-                await importPackToWorld(pack, (current, total) => {
-                    btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`;
-                });
-                this.refreshGridOnly({ preserveScroll: true });
-            } catch (err) {
-                ui.notifications.error(err.message);
-                this.refreshGridOnly({ preserveScroll: true });
-            }
-        });
-
-        refreshBtn.addEventListener("click", async () => {
-            try {
-                await loadCatalog(true);
-                if (this.selectedPack) {
-                    this.selectedPack = (catalogCache?.packs || []).find(p => p.moduleId === this.selectedPack.moduleId) || null;
-                }
-                this.refreshGridOnly({ preserveScroll: true });
-                ui.notifications.info(game.i18n.localize("ZMB.CatalogRefreshed"));
-            } catch (err) {
-                ui.notifications.error(err.message);
-            }
-        });
-
-        backBtn.addEventListener("click", () => {
-            this._goBackToPacks();
-        });
-    }
-
-    refreshGridOnly(options = {}) {
-        if (!this.gridContainer || !catalogCache) return;
-        const prevScroll = this.gridContainer.scrollTop;
-        this.thumbQueue.reset(this.gridContainer);
-        this.sentinelObserver?.disconnect();
-
-        if (this.selectedPack) {
-            this._renderScenesView(this.selectedPack);
-        } else {
-            this._renderPacksView();
-        }
-
-        const targetScroll = typeof options.scrollTop === "number"
-        ? options.scrollTop
-        : (options.preserveScroll ? prevScroll : 0);
-
-        if (targetScroll > 0) {
-            while (
-                this.renderedCount < this.activeList.length &&
-                this.gridContainer.scrollHeight < targetScroll + (this.gridContainer.clientHeight || 700)
-            ) {
-                this._appendNextChunk();
-            }
-            this.gridContainer.scrollTop = targetScroll;
-        } else {
-            this.gridContainer.scrollTop = 0;
-        }
-    }
-
-    _renderPacksView() {
-        const baseUrl = getServerUrl();
-        const worldIndex = buildWorldSceneIndex();
-
-        this.backButton.style.display = "none";
-        this.catSelect.style.display = "";
-        this.packImportHeaderBtn.style.display = "none";
-        this.gridContainer.innerHTML = "";
-
-        const packs = catalogCache.packs || [];
-        const filtered = [];
-
-        for (const pack of packs) {
-            if (this.filterCategory !== "all" && pack.category !== this.filterCategory) continue;
-
-            if (this.searchQuery) {
-                const searchBlob = pack._searchBlob || "";
-                if (!searchBlob.includes(this.searchQuery)) continue;
-            }
-
-            const status = getPackStatus(pack, worldIndex);
-            if (this.filterStatus === "imported" && !status.isImported) continue;
-            if (this.filterStatus === "not-imported" && status.isImported) continue;
-
-            filtered.push({ pack, status });
-        }
-
-        this.countElement.textContent = `${game.i18n.localize("ZMB.Displayed")}: ${filtered.length} / ${packs.length}`;
-
-        if (filtered.length === 0) {
-            this.gridContainer.innerHTML = `<div class="zmb-empty" style="grid-column: 1 / -1;">${game.i18n.localize("ZMB.NoResults")}</div>`;
-            return;
-        }
-
-        const labelScene = game.i18n.localize("ZMB.SceneType");
-        const labelMap = game.i18n.localize("ZMB.MapType");
-        const labelNotImp = game.i18n.localize("ZMB.NotImportedLabel");
-        const labelImp = game.i18n.localize("ZMB.ImportedLabel");
-        const labelPart = game.i18n.localize("ZMB.PartialLabel");
-        const labelInWorld = game.i18n.localize("ZMB.InWorld");
-        const labelImport = game.i18n.localize("ZMB.Import");
-        const labelScenes = game.i18n.localize("ZMB.Scenes");
-
-        this._setupChunkedGrid(filtered, "packs", ({ pack, status }, idx) => {
-            const tile = document.createElement("div");
-            tile.className = `zmb-tile ${status.isImported ? "is-imported" : ""}`;
-            tile.dataset.idx = idx;
-
-            const versionStr = pack._versionStr || foundry.utils.escapeHTML(pack.version ? `v${pack.version}` : "v1.0");
-            const coverCandidates = getPackCoverCandidates(baseUrl, pack);
-            const primaryThumbUrl = coverCandidates[0] || FALLBACK_THUMB;
-            const safeTitle = pack._safeTitle || foundry.utils.escapeHTML(getCleanPackTitle(pack));
-
-            const isSceneCat = pack.category === "scene";
-            const catLabel = isSceneCat ? labelScene : labelMap;
-            const catClass = isSceneCat ? "cat-scene" : "cat-map";
-
-            let statusLabel = labelNotImp;
-            let statusClass = "";
-            if (status.isFullyImported) {
-                statusLabel = `${labelImp} (${status.importedCount}/${status.totalCount})`;
-                statusClass = "imported";
-            } else if (status.isImported) {
-                statusLabel = `${labelPart} (${status.importedCount}/${status.totalCount})`;
-                statusClass = "partial";
-            }
-
-            tile.innerHTML = `
-            <div class="zmb-thumb" data-action="open-pack">
-            <img data-src="${foundry.utils.escapeHTML(primaryThumbUrl)}" alt="${safeTitle}" />
-            <div class="zmb-meta-overlay">
-            <span class="zmb-tag ${catClass}">${catLabel} • ${status.totalCount}</span>
-            <span class="zmb-tag">${versionStr}</span>
-            </div>
-            <div class="zmb-status-bar ${statusClass}">
-            <span class="zmb-status-text">${statusLabel}</span>
-            <div class="zmb-progress-fill" style="width: 0%;"></div>
-            </div>
-            </div>
-            <div class="zmb-body">
-            <div class="zmb-title" title="${safeTitle}">${safeTitle}</div>
-            <div class="zmb-actions">
-            <button type="button" class="zmb-import-pack" data-action="import-pack" ${status.isFullyImported ? "disabled" : ""}>
-            <i class="fa-solid ${status.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
-            ${status.isFullyImported ? labelInWorld : labelImport}
-            </button>
-            <button type="button" class="zmb-view-scenes" data-action="open-pack">
-            <i class="fa-solid fa-folder-open"></i> ${labelScenes}
-            </button>
-            </div>
-            </div>
-            `;
-
-            const imgEl = tile.querySelector("img");
-            imgEl._fallbacks = coverCandidates.slice(1);
-            return tile;
-        });
-    }
-
-    _renderScenesView(pack) {
-        const baseUrl = getServerUrl();
-        const worldIndex = buildWorldSceneIndex();
-        const packStatus = getPackStatus(pack, worldIndex);
-
-        this.backButton.style.display = "";
-        this.catSelect.style.display = "none";
-        this.packImportHeaderBtn.style.display = "";
-        this.packImportHeaderBtn.disabled = packStatus.isFullyImported;
-        this.packImportHeaderBtn.innerHTML = `
-        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
-        ${packStatus.isFullyImported
-            ? `${game.i18n.localize("ZMB.InWorld")} (${packStatus.importedCount}/${packStatus.totalCount})`
-            : `${game.i18n.localize("ZMB.ImportPackBtn")} (${packStatus.importedCount}/${packStatus.totalCount})`}
-            `;
-
-            this.gridContainer.innerHTML = "";
-
-            const cleanTitle = getCleanPackTitle(pack);
-            const versionStr = pack._versionStr || foundry.utils.escapeHTML(pack.version ? `v${pack.version}` : "v1.0");
-            const packScenes = Array.isArray(pack.scenes) ? pack.scenes : [];
-            const defaultSceneLabel = game.i18n.localize("ZMB.SceneDefaultName");
-            const previewHintTitle = foundry.utils.escapeHTML(game.i18n.localize("ZMB.PreviewImage"));
-            const scenes = [];
-
-            for (const sceneMeta of packScenes) {
-                const sName = sceneMeta.name || defaultSceneLabel;
-                if (this.searchQuery && !sName.toLowerCase().includes(this.searchQuery)) continue;
-
-                const worldScene = findWorldScene(worldIndex, pack.moduleId, sceneMeta.id);
-                const isImported = Boolean(worldScene);
-
-                if (this.filterStatus === "imported" && !isImported) continue;
-                if (this.filterStatus === "not-imported" && isImported) continue;
-
-                scenes.push({ sceneMeta, worldScene, isImported });
-            }
-
-            scenes.sort((a, b) => naturalCollator.compare(a.sceneMeta.name || "", b.sceneMeta.name || ""));
-
-            this.countElement.textContent = `${cleanTitle} (${pack.version ? `v${pack.version}` : "v1.0"}) — ${game.i18n.localize("ZMB.Scenes")}: ${scenes.length} / ${getPackTotalCount(pack)}`;
-
-            if (scenes.length === 0) {
-                this.gridContainer.innerHTML = `<div class="zmb-empty" style="grid-column: 1 / -1;">${game.i18n.localize("ZMB.NoResults")}</div>`;
-                return;
-            }
-
-            const labelImp = game.i18n.localize("ZMB.ImportedLabel");
-            const labelNotImp = game.i18n.localize("ZMB.NotImportedLabel");
-            const labelInWorld = game.i18n.localize("ZMB.InWorld");
-            const labelImport = game.i18n.localize("ZMB.Import");
-            const labelOpen = game.i18n.localize("ZMB.Open");
-
-            this._setupChunkedGrid(scenes, "scenes", ({ sceneMeta, isImported }, idx) => {
-                const tile = document.createElement("div");
-                tile.className = `zmb-tile ${isImported ? "is-imported" : ""}`;
-                tile.dataset.idx = idx;
-
-                const thumbCandidates = getSceneThumbCandidates(baseUrl, pack, sceneMeta);
-                const primaryThumbUrl = thumbCandidates[0] || FALLBACK_THUMB;
-                const sceneName = sceneMeta.name || defaultSceneLabel;
-                const safeSceneName = foundry.utils.escapeHTML(sceneName);
-                const itemStatus = isImported ? labelImp : labelNotImp;
-
-                tile.innerHTML = `
-                <div class="zmb-thumb" data-action="preview-scene" title="${previewHintTitle}">
-                <img data-src="${foundry.utils.escapeHTML(primaryThumbUrl)}" alt="${safeSceneName}" />
-                <div class="zmb-meta-overlay">
-                <span class="zmb-tag">${Number(sceneMeta.width) || "?"}×${Number(sceneMeta.height) || "?"}</span>
-                <span class="zmb-tag">${versionStr}</span>
-                </div>
-                <div class="zmb-preview-hint"><i class="fa-solid fa-magnifying-glass-plus"></i></div>
-                <div class="zmb-status-bar ${isImported ? "imported" : ""}">
-                <span class="zmb-status-text">${itemStatus}</span>
-                </div>
-                </div>
-                <div class="zmb-body">
-                <div class="zmb-title" title="${safeSceneName}">${safeSceneName}</div>
-                <div class="zmb-actions">
-                <button type="button" class="zmb-import-scene" data-action="import-scene" ${isImported ? "disabled" : ""}>
-                <i class="fa-solid ${isImported ? "fa-check" : "fa-download"}"></i>
-                ${isImported ? labelInWorld : labelImport}
-                </button>
-                <button type="button" class="zmb-open-scene" data-action="open-scene">
-                <i class="fa-solid fa-eye"></i> ${labelOpen}
-                </button>
-                </div>
-                </div>
-                `;
-
-                const imgEl = tile.querySelector("img");
-                imgEl._fallbacks = thumbCandidates.slice(1);
-                return tile;
-            });
-    }
-}
+            const
