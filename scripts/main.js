@@ -195,146 +195,6 @@ async function renderSceneAmbilight(canvasInstance) {
 }
 
 /* -------------------------------------------- */
-/*  Przeliczanie współrzędnych przy Padding = 0 */
-/* -------------------------------------------- */
-
-function computePaddingPixelOffset(width, height, grid, padding) {
-    if (!padding || padding <= 0) return { dx: 0, dy: 0 };
-    try {
-        if (typeof Canvas?.getDimensions === "function") {
-            const d = Canvas.getDimensions({ width, height, grid, padding });
-            if (Number.isFinite(d?.sceneX) && Number.isFinite(d?.sceneY)) {
-                return { dx: d.sceneX, dy: d.sceneY };
-            }
-        }
-    } catch {}
-    const gridSize = Number(typeof grid === "object" ? grid?.size : grid) || 100;
-    return {
-        dx: Math.ceil(((Number(width) || 4000) * padding) / gridSize) * gridSize,
-        dy: Math.ceil(((Number(height) || 3000) * padding) / gridSize) * gridSize
-    };
-}
-
-function shiftEmbeddedForPaddingChange(sceneData, dx, dy) {
-    if (!dx && !dy) return;
-
-    if (Array.isArray(sceneData.tiles)) {
-        for (const t of sceneData.tiles) {
-            if (typeof t.x === "number") t.x -= dx;
-            if (typeof t.y === "number") t.y -= dy;
-        }
-    }
-    if (Array.isArray(sceneData.walls)) {
-        for (const w of sceneData.walls) {
-            if (Array.isArray(w.c) && w.c.length === 4) {
-                w.c = [w.c[0] - dx, w.c[1] - dy, w.c[2] - dx, w.c[3] - dy];
-            }
-        }
-    }
-    for (const key of ["lights", "sounds", "tokens", "notes", "drawings", "templates"]) {
-        if (Array.isArray(sceneData[key])) {
-            for (const item of sceneData[key]) {
-                if (typeof item.x === "number") item.x -= dx;
-                if (typeof item.y === "number") item.y -= dy;
-            }
-        }
-    }
-}
-
-/* -------------------------------------------- */
-/*  Domyślne parametry scen (padding 0, #000000)*/
-/* -------------------------------------------- */
-
-function buildDefaultSceneVisualUpdates(sceneDoc) {
-    const updates = {};
-
-    if (sceneDoc.padding !== 0) {
-        const oldPad = Number(sceneDoc.padding) || 0;
-        const { dx, dy } = computePaddingPixelOffset(sceneDoc.width, sceneDoc.height, sceneDoc.grid, oldPad);
-        updates.padding = 0;
-
-        if (dx || dy) {
-            if (sceneDoc.tiles?.size > 0) {
-                updates.tiles = sceneDoc.tiles.map(t => {
-                    const obj = t.toObject();
-                    obj.x = (Number(obj.x) || 0) - dx;
-                    obj.y = (Number(obj.y) || 0) - dy;
-                    return obj;
-                });
-            }
-            if (sceneDoc.walls?.size > 0) {
-                updates.walls = sceneDoc.walls.map(w => {
-                    const obj = w.toObject();
-                    if (Array.isArray(obj.c) && obj.c.length === 4) {
-                        obj.c = [obj.c[0] - dx, obj.c[1] - dy, obj.c[2] - dx, obj.c[3] - dy];
-                    }
-                    return obj;
-                });
-            }
-            for (const key of ["lights", "sounds", "tokens", "notes", "drawings", "templates"]) {
-                const coll = sceneDoc[key];
-                if (coll?.size > 0) {
-                    updates[key] = coll.map(item => {
-                        const obj = item.toObject();
-                        if (typeof obj.x === "number") obj.x -= dx;
-                        if (typeof obj.y === "number") obj.y -= dy;
-                        return obj;
-                    });
-                }
-            }
-        }
-    }
-
-    if (sceneDoc.backgroundColor !== "#000000") {
-        updates.backgroundColor = "#000000";
-    }
-    if (Scene.schema?.fields?.transition && sceneDoc.transition?.type !== "fade") {
-        updates.transition = foundry.utils.mergeObject(
-            sceneDoc.transition ? sceneDoc.transition.toObject?.() || sceneDoc.transition : {},
-                                                       { type: "fade" },
-                                                       { inplace: false }
-        );
-    }
-    if (sceneDoc.levels?.contents?.length > 0) {
-        const levelsArr = sceneDoc.levels.map(l => l.toObject());
-        let levelsChanged = false;
-        for (const l of levelsArr) {
-            if (l.background?.color !== "#000000") {
-                l.background = foundry.utils.mergeObject(l.background || {}, { color: "#000000" });
-                levelsChanged = true;
-            }
-        }
-        if (levelsChanged) {
-            updates.levels = levelsArr;
-        }
-    }
-
-    return updates;
-}
-
-async function enforceDefaultsOnAllExistingScenes() {
-    if (!game.user?.isGM) return;
-    if (!game.settings.get(MODULE_ID, "enforceSceneDefaults")) return;
-
-    const batch = [];
-    for (const s of game.scenes) {
-        const u = buildDefaultSceneVisualUpdates(s);
-        if (Object.keys(u).length > 0) {
-            u._id = s.id;
-            batch.push(u);
-        }
-    }
-
-    if (batch.length > 0) {
-        try {
-            await Scene.updateDocuments(batch);
-        } catch (err) {
-            console.warn(`[${MODULE_ID}] Nie udało się zaktualizować części scen:`, err);
-        }
-    }
-}
-
-/* -------------------------------------------- */
 /*  Inicjalizacja i ustawienia                  */
 /* -------------------------------------------- */
 
@@ -380,15 +240,8 @@ Hooks.once("init", () => {
         scope: "world",
         config: true,
         type: Boolean,
-        default: false,
-            onChange: (val) => {
-                if (val) enforceDefaultsOnAllExistingScenes();
-            }
+        default: false
     });
-});
-
-Hooks.once("ready", () => {
-    enforceDefaultsOnAllExistingScenes();
 });
 
 Hooks.on("preCreateScene", (sceneDoc) => {
@@ -872,8 +725,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     const prepared = foundry.utils.deepClone(raw);
     delete prepared._id;
 
-    const originalPadding = typeof raw.padding === "number" ? raw.padding : 0.25;
-
     const rawBgPath =
     meta?.bg ||
     raw.background?.src ||
@@ -1017,10 +868,6 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
     }
 
     if (enforceDefaults) {
-        if (originalPadding > 0) {
-            const { dx, dy } = computePaddingPixelOffset(prepared.width, prepared.height, prepared.grid, originalPadding);
-            shiftEmbeddedForPaddingChange(prepared, dx, dy);
-        }
         prepared.padding = 0;
         prepared.backgroundColor = "#000000";
         if (Scene.schema?.fields?.transition) {
