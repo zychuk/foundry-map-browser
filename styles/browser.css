@@ -1,3 +1,7 @@
+/* ============================================ */
+/*  Układ głównego okna i kontenera             */
+/* ============================================ */
+
 .zychu-map-browser .window-content {
     display: flex;
     flex-direction: column;
@@ -15,6 +19,15 @@
     overflow: hidden;
     contain: layout style;
 }
+
+.zmb-container.is-dragging,
+.zmb-container.is-dragging * {
+    pointer-events: none !important;
+}
+
+/* ============================================ */
+/*  Pasek narzędzi i filtrów (Toolbar)          */
+/* ============================================ */
 
 .zmb-toolbar {
     display: flex;
@@ -54,6 +67,10 @@
     font-weight: 500;
 }
 
+/* ============================================ */
+/*  Siatka i kafelki (Grid & Tiles)             */
+/* ============================================ */
+
 .zmb-grid {
     flex: 1;
     min-height: 0;
@@ -67,6 +84,13 @@
     contain: layout paint style;
 }
 
+.zmb-sentinel {
+    grid-column: 1 / -1;
+    width: 100%;
+    height: 4px;
+    pointer-events: none;
+}
+
 .zmb-tile {
     display: flex;
     flex-direction: column;
@@ -77,6 +101,8 @@
     background: rgba(0, 0, 0, 0.25);
     box-sizing: border-box;
     contain: layout paint style;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 240px;
 }
 
 .zmb-tile:hover {
@@ -90,6 +116,10 @@
 .zmb-tile.is-imported:hover {
     border-color: #4caf50;
 }
+
+/* ============================================ */
+/*  Miniatura i plakietki (Thumbnail & Badges)  */
+/* ============================================ */
 
 .zmb-thumb {
     position: relative;
@@ -206,6 +236,10 @@
     color: #fff;
 }
 
+/* ============================================ */
+/*  Dolna sekcja kafelka i przyciski akcji      */
+/* ============================================ */
+
 .zmb-body {
     padding: 8px;
     display: flex;
@@ -260,21 +294,4 @@
     padding: 30px;
     text-align: center;
     opacity: 0.75;
-}
-
-.zmb-tile {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 210px;
-}
-
-.zmb-sentinel {
-    grid-column: 1 / -1;
-    width: 100%;
-    height: 4px;
-    pointer-events: none;
-}
-
-.zmb-container.is-dragging,
-.zmb-container.is-dragging * {
-    pointer-events: none !important;
 }
