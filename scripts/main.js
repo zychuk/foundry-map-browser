@@ -1,6 +1,7 @@
 const MODULE_ID = "zychu-map-browser";
 const ROOT_SCENE_FOLDER = "Zychu Maps";
 const FALLBACK_THUMB = "icons/svg/direction.svg";
+const DEFAULT_SCENE_PADDING = 0.25;
 
 let catalogCache = null;
 let browserInstance = null;
@@ -43,6 +44,22 @@ function destroyAmbilightSprite() {
     }
 }
 
+function getActualMapImageBounds(canvasInstance) {
+    const sr = canvasInstance.dimensions.sceneRect;
+    const bgMesh = canvasInstance.primary?.background;
+    if (bgMesh && bgMesh.width > 0 && bgMesh.height > 0) {
+        const ax = bgMesh.anchor?.x ?? 0;
+        const ay = bgMesh.anchor?.y ?? 0;
+        return {
+            x: bgMesh.x - (bgMesh.width * ax),
+            y: bgMesh.y - (bgMesh.height * ay),
+            width: bgMesh.width,
+            height: bgMesh.height
+        };
+    }
+    return { x: sr.x, y: sr.y, width: sr.width, height: sr.height };
+}
+
 async function renderSceneAmbilight(canvasInstance) {
     destroyAmbilightSprite();
 
@@ -50,8 +67,8 @@ async function renderSceneAmbilight(canvasInstance) {
         if (!game.settings.get(MODULE_ID, "enableAmbilight")) return;
         if (!canvasInstance?.ready || !canvasInstance?.dimensions?.sceneRect) return;
 
-        const sr = canvasInstance.dimensions.sceneRect;
-        if (!sr || sr.width <= 0 || sr.height <= 0) return;
+        const imgBounds = getActualMapImageBounds(canvasInstance);
+        if (!imgBounds || imgBounds.width <= 0 || imgBounds.height <= 0) return;
 
         const bgSrc =
         canvasInstance.level?.background?.src ||
@@ -69,12 +86,12 @@ async function renderSceneAmbilight(canvasInstance) {
         });
         if (!loaded || !canvasInstance.ready) return;
 
-        // Zachowaj proporcje mapy na płótnie pomocniczym, aby rozmycie było równe z każdej strony
-        const aspect = sr.width / sr.height;
-        const BASE_INNER = 360;
-        const innerW = aspect >= 1 ? BASE_INNER : Math.max(120, Math.round(BASE_INNER * aspect));
-        const innerH = aspect >= 1 ? Math.max(120, Math.round(BASE_INNER / aspect)) : BASE_INNER;
-        const MARGIN = 110;
+        // Dopasuj proporcje płótna do rzeczywistych proporcji obrazka mapy
+        const aspect = imgBounds.width / imgBounds.height;
+        const BASE_INNER = 384;
+        const innerW = aspect >= 1 ? BASE_INNER : Math.max(128, Math.round(BASE_INNER * aspect));
+        const innerH = aspect >= 1 ? Math.max(128, Math.round(BASE_INNER / aspect)) : BASE_INNER;
+        const MARGIN = 120;
         const canvasW = innerW + MARGIN * 2;
         const canvasH = innerH + MARGIN * 2;
 
@@ -83,36 +100,65 @@ async function renderSceneAmbilight(canvasInstance) {
         offCanvas.height = canvasH;
         const ctx = offCanvas.getContext("2d");
 
-        // Warstwa 1: Szeroka, miękka poświata zewnętrzna
+        // Narysuj rozmyty obraz lekko rozszerzony poza MARGIN (+18px),
+        // dzięki czemu dokładnie na krawędzi obrazka poświata ma 100% krycia i nie tworzy ciemnej linii styku
         ctx.save();
-        ctx.filter = "blur(42px) saturate(1.9) brightness(1.08)";
-        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.filter = "blur(44px) saturate(1.95) brightness(1.1)";
+        ctx.drawImage(img, MARGIN - 18, MARGIN - 18, innerW + 36, innerH + 36);
         ctx.restore();
 
-        // Warstwa 2: Mocniejsza poświata blisko krawędzi mapy
         ctx.save();
-        ctx.filter = "blur(20px) saturate(1.75) brightness(1.05)";
-        ctx.drawImage(img, MARGIN, MARGIN, innerW, innerH);
+        ctx.filter = "blur(20px) saturate(1.8) brightness(1.06)";
+        ctx.drawImage(img, MARGIN - 10, MARGIN - 10, innerW + 20, innerH + 20);
+        ctx.restore();
+
+        // Wytnij środek mapy z miękkim 7-pikselowym przejściem (bez użycia ctx.filter, więc idealnie co do piksela)
+        ctx.save();
+        ctx.filter = "none";
+        ctx.globalCompositeOperation = "destination-out";
+        const FEATHER_STEPS = 7;
+        for (let i = 0; i < FEATHER_STEPS; i++) {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.28)";
+            ctx.fillRect(
+                MARGIN + i,
+                MARGIN + i,
+                innerW - i * 2,
+                innerH - i * 2
+            );
+        }
+        ctx.clearRect(
+            MARGIN + FEATHER_STEPS,
+            MARGIN + FEATHER_STEPS,
+            innerW - FEATHER_STEPS * 2,
+            innerH - FEATHER_STEPS * 2
+        );
         ctx.restore();
 
         const tex = PIXI.Texture.from(offCanvas);
         const sprite = new PIXI.Sprite(tex);
 
-        const padX = sr.width * (MARGIN / innerW);
-        const padY = sr.height * (MARGIN / innerH);
+        const padX = imgBounds.width * (MARGIN / innerW);
+        const padY = imgBounds.height * (MARGIN / innerH);
 
-        sprite.x = sr.x - padX;
-        sprite.y = sr.y - padY;
-        sprite.width = sr.width + padX * 2;
-        sprite.height = sr.height + padY * 2;
+        sprite.x = imgBounds.x - padX;
+        sprite.y = imgBounds.y - padY;
+        sprite.width = imgBounds.width + padX * 2;
+        sprite.height = imgBounds.height + padY * 2;
         sprite.alpha = 1.0;
         sprite.eventMode = "none";
         sprite.interactiveChildren = false;
 
-        // Umieść poświatę w canvas.environment na samym spodzie (bezpośrednio POD mapą i tokenami)
-        const envContainer = canvasInstance.environment || canvasInstance.primary?.parent;
-        if (envContainer) {
-            envContainer.addChildAt(sprite, 0);
+        // Umieść w canvas.interface (tuż nad siatką/obwódką sceny, aby zakryć czarną linię wokół krawędzi obrazka)
+        const targetGroup = canvasInstance.interface || canvasInstance.environment;
+        if (targetGroup) {
+            const gridIdx = canvasInstance.interface?.grid
+            ? targetGroup.children.indexOf(canvasInstance.interface.grid)
+            : -1;
+            if (gridIdx >= 0) {
+                targetGroup.addChildAt(sprite, gridIdx + 1);
+            } else {
+                targetGroup.addChildAt(sprite, 0);
+            }
             currentAmbilightSprite = sprite;
         }
     } catch (err) {
@@ -121,14 +167,14 @@ async function renderSceneAmbilight(canvasInstance) {
 }
 
 /* -------------------------------------------- */
-/*  Domyślne parametry scen (padding 0, #000000)*/
+/*  Domyślne parametry scen (padding, #000000)  */
 /* -------------------------------------------- */
 
 function buildDefaultSceneVisualUpdates(sceneDoc) {
     const updates = {};
 
-    if (sceneDoc.padding !== 0) {
-        updates.padding = 0;
+    if (sceneDoc.padding !== DEFAULT_SCENE_PADDING) {
+        updates.padding = DEFAULT_SCENE_PADDING;
     }
     if (sceneDoc.backgroundColor !== "#000000") {
         updates.backgroundColor = "#000000";
@@ -144,8 +190,8 @@ function buildDefaultSceneVisualUpdates(sceneDoc) {
         const levelsArr = sceneDoc.levels.map(l => l.toObject());
         let levelsChanged = false;
         for (const l of levelsArr) {
-            if (l.background?.color !== "#000000") {
-                l.background = foundry.utils.mergeObject(l.background || {}, { color: "#000000" });
+            if (l.background && l.background.color !== null) {
+                l.background.color = null;
                 levelsChanged = true;
             }
         }
@@ -173,7 +219,7 @@ async function enforceDefaultsOnAllExistingScenes() {
     if (batch.length > 0) {
         try {
             await Scene.updateDocuments(batch);
-            console.log(`[${MODULE_ID}] Zaktualizowano domyślny wygląd (${batch.length} scen): padding=0, bg=#000000, transition=fade.`);
+            console.log(`[${MODULE_ID}] Zaktualizowano wygląd (${batch.length} scen): padding=${DEFAULT_SCENE_PADDING}, bg=#000000, transition=fade.`);
         } catch (err) {
             console.warn(`[${MODULE_ID}] Nie udało się zaktualizować części scen:`, err);
         }
@@ -210,7 +256,7 @@ Hooks.once("init", () => {
 
     game.settings.register(MODULE_ID, "enableAmbilight", {
         name: "Efekt Ambient Light (YouTube Ambilight)",
-                           hint: "Dodaje pod mapą miękką, kolorową poświatę z jej krawędzi przechodzącą w czerń (#000000).",
+                           hint: "Rozmywa kolory krawędzi obrazka mapy w miękką poświatę przechodzącą w czerń (#000000) na obszarze paddingu.",
                            scope: "client",
                            config: true,
                            type: Boolean,
@@ -221,8 +267,8 @@ Hooks.once("init", () => {
     });
 
     game.settings.register(MODULE_ID, "enforceSceneDefaults", {
-        name: "Wymuszaj Padding 0, Czarne Tło (#000000) i Przejście Fade",
-                           hint: "Automatycznie ustawia padding=0, kolor tła #000000 i przejście 'fade' dla wszystkich istniejących i nowych scen.",
+        name: "Wymuszaj Czarne Tło (#000000), Padding 0.25 i Przejście Fade",
+                           hint: "Automatycznie ustawia czarne tło #000000, padding 0.25 (do swobodnego oddalania) i przejście 'fade' dla wszystkich scen.",
                            scope: "world",
                            config: true,
                            type: Boolean,
@@ -240,7 +286,7 @@ Hooks.once("ready", () => {
 Hooks.on("preCreateScene", (sceneDoc) => {
     if (!game.settings.get(MODULE_ID, "enforceSceneDefaults")) return;
     const updates = {
-        padding: 0,
+        padding: DEFAULT_SCENE_PADDING,
         backgroundColor: "#000000"
     };
     if (Scene.schema?.fields?.transition) {
@@ -487,7 +533,6 @@ async function ensureWorldDirectory(targetDir) {
 
     const FP = foundry.applications?.apps?.FilePicker?.implementation ?? FilePicker;
 
-    // Sprawdź czy katalog już istnieje i zaindeksuj obecne w nim pliki
     try {
         const browsed = await FP.browse("data", targetDir);
         if (browsed?.files) {
@@ -587,7 +632,6 @@ async function downloadAssetToWorld(baseUrl, assetPath, moduleId, subFolderHint 
         existingWorldFilesCache.add(expectedLocalPath);
         uploadedAssetsCache.set(cacheKey, savedPath);
 
-        // Krótka przerwa, aby proces Node.js serwera Foundry zwolnił bufory C++ przed kolejnym plikiem
         await delay(40);
 
         return savedPath;
@@ -745,9 +789,8 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         }
     }
 
-    // Zawsze wymuszaj czarne tło #000000 i padding 0
     const bgColor = "#000000";
-    prepared.padding = 0;
+    prepared.padding = DEFAULT_SCENE_PADDING;
 
     if (!prepared.width && meta?.width) prepared.width = Number(meta.width);
     if (!prepared.height && meta?.height) prepared.height = Number(meta.height);
@@ -855,8 +898,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
         console.warn(`[${MODULE_ID}] Scene.migrateData warning:`, err);
     }
 
-    // Po migracji wymuś padding 0, czarne tło #000000 i przejście 'fade'
-    prepared.padding = 0;
+    prepared.padding = DEFAULT_SCENE_PADDING;
     prepared.backgroundColor = bgColor;
     if (Scene.schema?.fields?.transition) {
         prepared.transition = foundry.utils.mergeObject(
@@ -893,7 +935,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
                 if (i === 0 || lvl.background?.src) {
                     lvl.background = foundry.utils.mergeObject(
                         typeof lvl.background === "object" && lvl.background ? lvl.background : {},
-                        { src: lvlBg, color: bgColor }
+                        { src: lvlBg, color: null }
                     );
                 }
             }
@@ -905,7 +947,7 @@ async function prepareSceneDataWithLocalAssets(raw, pack, meta, folderId, baseUr
                     name: "Initial Level",
                     background: {
                         src: localBgPath,
-                        color: bgColor
+                        color: null
                     }
                 }
             ];
@@ -939,11 +981,11 @@ async function ensureCreatedScenesHaveLevelBg(createdDocs) {
         if (!expectedBg) continue;
 
         const firstLevel = sceneDoc.levels?.contents?.[0];
-        if (firstLevel && (firstLevel.background?.src !== expectedBg || firstLevel.background?.color !== "#000000")) {
+        if (firstLevel && (firstLevel.background?.src !== expectedBg || firstLevel.background?.color !== null)) {
             try {
                 await firstLevel.update({
                     "background.src": expectedBg,
-                    "background.color": "#000000"
+                    "background.color": null
                 });
             } catch (err) {
                 console.warn(`[${MODULE_ID}] Failed to update level background:`, err);
@@ -1535,7 +1577,7 @@ class HomelabMapBrowser extends BaseApp {
         this.packImportHeaderBtn.style.display = "";
         this.packImportHeaderBtn.disabled = packStatus.isFullyImported;
         this.packImportHeaderBtn.innerHTML = `
-        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}</i>
+        <i class="fa-solid ${packStatus.isFullyImported ? "fa-check" : "fa-file-import"}"></i>
         ${packStatus.isFullyImported
             ? `${game.i18n.localize("ZMB.InWorld")} (${packStatus.importedCount}/${packStatus.totalCount})`
             : `${game.i18n.localize("ZMB.ImportPackBtn")} (${packStatus.importedCount}/${packStatus.totalCount})`}
