@@ -5,7 +5,7 @@
   "ZMB.EnableAmbilightName": "Efekt Ambient Light (YouTube Ambilight)",
   "ZMB.EnableAmbilightHint": "Dodaje pod mapą miękką, kolorową poświatę z jej krawędzi przechodzącą w czerń (#000000).",
   "ZMB.EnforceSceneDefaultsName": "Wymuszaj Padding 0, Czarne Tło (#000000) i Przejście Fade",
-  "ZMB.EnforceSceneDefaultsHint": "Automatycznie ustawia padding=0, kolor tła #000000 i przejście 'fade' dla wszystkich istniejących i nowych scen.",
+  "ZMB.EnforceSceneDefaultsHint": "Automatycznie ustawia padding=0, kolor tła #000000 i przejście 'fade' dla wszystkich nowo importowanych scen.",
   "ZMB.WindowMainTitle": "Zychu's Map Browser",
   "ZMB.SearchPlaceholder": "Szukaj po nazwie...",
   "ZMB.StatusAll": "Status: Wszystkie",
