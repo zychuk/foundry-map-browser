@@ -26,7 +26,7 @@ Hooks.once("init", () => {
     game.settings.register(MODULE_ID, "enableAmbilight", {
         name: "ZMB.EnableAmbilightName",
         hint: "ZMB.EnableAmbilightHint",
-        scope: "client",
+        scope: "world",
         config: true,
         type: Boolean,
         default: false,
